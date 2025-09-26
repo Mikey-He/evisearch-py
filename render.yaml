@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: evisearch
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: |
+      pip install -U pip
+      pip install -e .
+      pip install fastapi uvicorn pdfminer.six
+    startCommand: uvicorn evisearch.api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BASIC_USER
+        value: "" 
+      - key: BASIC_PASS
+        value: "" 
