@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evisearch-py"
+version = "1.0.0"
+description = "Evidence-level mini search engine (Boolean/Phrase/BM25) with CLI and REST API"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# 仅打包 evisearch 包，避免把 data/ tests/ 等误当成顶层包
+[tool.setuptools]
+packages = ["evisearch"]
+
+# ---------- Ruff ----------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# E,F: pycodestyle/pyflakes  I: import sort  UP: pyupgrade
+# B: flake8-bugbear  ARG: unused-argument
+select = ["E", "F", "I", "UP", "B", "ARG"]
+ignore = []
+
+# ---------- Black ----------
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+# ---------- Pytest ----------
+[tool.pytest.ini_options]
+addopts = "-q --cov=evisearch --cov-report=term:skip-covered --cov-fail-under=70"
+testpaths = ["tests"]
+
+# ---------- Mypy ----------
+[tool.mypy]
+python_version = "3.12"
+packages = ["evisearch"]
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+exclude = ["bench/", "tests/", "data/", "build/", "dist/"]
+
+# ---------- Coverage ----------
+[tool.coverage.run]
+branch = true
+source = ["evisearch"]
+omit = [
+  "evisearch/api.py",
+  "evisearch/cli.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

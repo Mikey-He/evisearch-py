@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: evisearch
+Version: 0.1.0
+Summary: EviSearch-Py: evidence-level mini search engine
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: pdfminer.six
+Requires-Dist: fastapi
+Requires-Dist: uvicorn
+
+﻿# EviSearch-Py

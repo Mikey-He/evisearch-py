@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+evisearch/__init__.py
+evisearch/analyzer.py
+evisearch.egg-info/PKG-INFO
+evisearch.egg-info/SOURCES.txt
+evisearch.egg-info/dependency_links.txt
+evisearch.egg-info/requires.txt
+evisearch.egg-info/top_level.txt
+tests/test_analyzer.py
