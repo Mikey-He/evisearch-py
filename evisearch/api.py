@@ -24,7 +24,7 @@ from .searcher import PhraseMatcher, Searcher
 
 # App & global state
 
-app = FastAPI(title="EviSearch-Py", version="1.2.0")
+app = FastAPI(title="EviSearch-Py", version="1.3.0")
 
 DATA_DIR = Path("data")
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -35,19 +35,19 @@ _ANALYZER = Analyzer()
 _INDEX_LOCK = threading.Lock()
 _INDEX: InvertedIndex | None = None
 
-# doc_id -> absolute file path (only for uploaded PDFs/TXTs)
+# doc_id -> original file path (only for uploaded PDFs/TXTs)
 _DOC_PATHS: dict[str, str] = {}
 
-# snippet/table windows
-LINES_WINDOW = 1  # text: hit line ±N lines
-COL_WINDOW = 1    # table: hit col ±N columns
+# windows for snippets
+LINES_WINDOW = 1  # text: show hit line ±N lines
+COL_WINDOW = 1    # table: show hit col ±N columns
 
-# ---------------------------------
-# Optional Basic Auth (BASIC_USER/PASS)
-# ---------------------------------
+# Optional Basic Auth (via env BASIC_USER/BASIC_PASS)
+
 basic_user = os.getenv("BASIC_USER") or ""
 basic_pass = os.getenv("BASIC_PASS") or ""
 security = HTTPBasic()
+
 
 def _needs_auth() -> bool:
     return bool(basic_user and basic_pass)
@@ -60,10 +60,8 @@ def _check_auth(credentials: HTTPBasicCredentials = Depends(security)) -> None: 
     if not ok:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+# Models
 
-# ---------------------------------
-# Pydantic I/O models (minimal)
-# ---------------------------------
 class DocIn(BaseModel):
     id: str
     text: str
@@ -73,18 +71,19 @@ class DocIn(BaseModel):
 class IndexIn(BaseModel):
     docs: list[DocIn]
 
+
 class IndexOut(BaseModel):
     ok: bool
     indexed: int
     vocab: int
 
+
 class SearchOut(BaseModel):
     results: list[dict]
 
-
-# Utilities
+# Helpers
 def _safe_doc_id(name: str) -> str:
-    base = os.path.basename(name)
+    base = os.path.basename(name or "doc")
     base = re.sub(r"[^\w\-.]+", "_", base)
     return base
 
@@ -93,8 +92,7 @@ def _extract_pdf_text_and_page_map(
     path: Path,
 ) -> tuple[str, list[tuple[int, int]]]:
     """
-    Use pdfplumber to extract text per page and compute a page_map
-    of (token_pos_offset, page_number) using stopword-inclusive tokenization.
+    Extract page texts and a page_map: (token_pos_offset, 1-based page_no).
     """
     texts: list[str] = []
     page_map: list[tuple[int, int]] = []
@@ -104,12 +102,11 @@ def _extract_pdf_text_and_page_map(
         for i, page in enumerate(pdf.pages, start=1):
             txt = page.extract_text() or ""
             texts.append(txt)
-            # token count for this page (keep stopwords = True to align positions)
-            page_tokens = list(_ANALYZER.iter_tokens(txt, keep_stopwords=True))
+            toks = list(_ANALYZER.iter_tokens(txt, keep_stopwords=True))
             page_map.append((pos, i))
-            pos += len(page_tokens)
+            pos += len(toks)
 
-    joined = "\n\n".join(texts)  # keep pages separated by a blank line
+    joined = "\n\n".join(texts)
     return joined, page_map
 
 
@@ -129,7 +126,7 @@ def _page_of_pos(doc_id: str, pos: int) -> int | None:
 
 
 def _representative_pos(doc_id: str, terms: list[str]) -> int | None:
-    """Pick the earliest occurrence position of any query term in the doc."""
+    """Pick earliest posting position of any term in the doc."""
     if _INDEX is None:
         return None
     best = None
@@ -145,15 +142,18 @@ def _representative_pos(doc_id: str, terms: list[str]) -> int | None:
     return best
 
 
-def _html_highlight(text: str, terms: list[str]) -> str:
-    """Escape HTML, then wrap any of the terms with <mark> (case-insensitive)."""
-    esc = html.escape(text)
+def _highlight_terms(text: str, terms: list[str]) -> str:
+    """
+    Escape HTML, then wrap matches with <mark> (word boundary, case-insensitive).
+    """
     if not terms:
-        return esc
+        return html.escape(text)
     pats = sorted(set(t for t in terms if t), key=len, reverse=True)
-    pattern = "(" + "|".join(re.escape(t) for t in pats) + ")"
-    rx = re.compile(pattern, re.IGNORECASE)
-    return rx.sub(r"<mark>\\1</mark>", esc)
+    rx = re.compile(
+        r"\b(" + "|".join(re.escape(t) for t in pats) + r")\b",
+        re.IGNORECASE,
+    )
+    return rx.sub(lambda m: f"<mark>{html.escape(m.group(0))}</mark>", html.escape(text))
 
 
 def _paragraph_snippet(doc_id: str, start_pos: int | None, terms: list[str]) -> dict:
@@ -161,12 +161,12 @@ def _paragraph_snippet(doc_id: str, start_pos: int | None, terms: list[str]) -> 
     Build a line-window snippet around the hit line: [hit-LINES_WINDOW, hit+LINES_WINDOW].
     """
     if _INDEX is None or start_pos is None:
-        return {"kind": "text", "html": "", "line": 0, "page": None}
+        return {"kind": "text", "snippet_html": "", "line": 0, "page": None}
 
     lines = _INDEX.doc_lines.get(doc_id, [])
     line_of_pos = _INDEX.line_of_pos.get(doc_id, [])
     if not lines or not line_of_pos or start_pos >= len(line_of_pos):
-        return {"kind": "text", "html": "", "line": 0, "page": None}
+        return {"kind": "text", "snippet_html": "", "line": 0, "page": None}
 
     hit = line_of_pos[start_pos]
     s = max(0, hit - LINES_WINDOW)
@@ -174,8 +174,8 @@ def _paragraph_snippet(doc_id: str, start_pos: int | None, terms: list[str]) -> 
     block = "\n".join(lines[s : e + 1])
 
     page = _page_of_pos(doc_id, start_pos)
-    html_block = "<pre class='snippet'>" + _html_highlight(block, terms) + "</pre>"
-    return {"kind": "text", "html": html_block, "line": hit + 1, "page": page}
+    html_block = "<pre class='snippet'>" + _highlight_terms(block, terms) + "</pre>"
+    return {"kind": "text", "snippet_html": html_block, "line": hit + 1, "page": page}
 
 
 def _is_numericish(s: str) -> bool:
@@ -187,9 +187,9 @@ def _is_numericish(s: str) -> bool:
 
 def _guess_header_row(tbl: list[list[str]]) -> int | None:
     """
-    Choose a row that looks like header:
+    Pick a row that looks like header:
     - If first row has letters and not all cells are numeric -> header
-    - Else among first 5 rows, pick the one with more non-numeric & letter ratio
+    - Else among first ~5 rows, prefer higher non-numeric / letter ratio
     """
     if not tbl:
         return None
@@ -215,89 +215,118 @@ def _guess_header_row(tbl: list[list[str]]) -> int | None:
     return idx
 
 
-def _table_snippet(doc_id: str, page: int | None, terms: list[str]) -> dict | None:
+def _table_snippet(
+    doc_id: str,
+    page_no: int,
+    terms: list[str],
+    cwin: int = COL_WINDOW,
+    rwin: int = 1,
+) -> dict[str, object] | None:
     """
-    Try to extract a table window:
-    - smart header detection
-    - find hit cell (ri, ci)
-    - return subtable: rows near hit and columns near hit
+    Return a dict for a table window if found:
+      {
+        "kind": "table",
+        "table_html": "<table>...</table>",
+        "bbox": [x0, y0, x1, y1],
+        "page": 1-based page number
+      }
     """
-    if page is None:
-        return None
-    pth = _DOC_PATHS.get(doc_id)
-    if not pth or not pth.lower().endswith(".pdf"):
+    pdf_path = _DOC_PATHS.get(doc_id)
+    if not pdf_path or not os.path.exists(pdf_path):
         return None
 
     try:
-        with pdfplumber.open(pth) as pdf:
-            if not (1 <= page <= len(pdf.pages)):
+        with pdfplumber.open(pdf_path) as pdf:
+            if page_no < 0 or page_no >= len(pdf.pages):
                 return None
-            pg = pdf.pages[page - 1]
-            tables = pg.extract_tables()
+            page = pdf.pages[page_no]
+
+            tables = page.find_tables(
+                table_settings={
+                    "vertical_strategy": "lines",
+                    "horizontal_strategy": "lines",
+                    "intersection_tolerance": 5,
+                }
+            )
             if not tables:
-                return None
+                tables = page.find_tables()
 
             terms_l = [t.lower() for t in terms if t]
-            for raw in tables:
-                tbl = [
-                    [
-                        c if isinstance(c, str) else ("" if c is None else str(c))
-                        for c in row
-                    ]
-                    for row in raw
-                ]
-                if not tbl:
-                    continue
+            best: tuple[int, object] | None = None
+            for tb in tables:
+                grid = tb.extract()
+                flat = " ".join((c or "") for row in grid for c in row)
+                hits = sum(1 for t in terms_l if re.search(rf"\b{re.escape(t)}\b", flat, re.I))
+                if hits > 0 and (best is None or hits > best[0]):
+                    best = (hits, tb)
 
-                header_idx = _guess_header_row(tbl)
-                data_start = (header_idx + 1) if header_idx is not None else 0
-                header = tbl[header_idx] if header_idx is not None else []
+            if best is None:
+                return None
 
-                # locate hit cell
-                hit_rc = None
-                for ri in range(data_start, len(tbl)):
-                    row_text = " | ".join(tbl[ri]).lower()
-                    if any(t in row_text for t in terms_l):
-                        best_ci = 0
-                        for ci, cell in enumerate(tbl[ri]):
-                            if any(t in (cell or "").lower() for t in terms_l):
-                                best_ci = ci
-                                break
-                        hit_rc = (ri, best_ci)
+            tb = best[1]
+            grid = tb.extract()
+
+            # locate a hit cell
+            hit_rc: list[tuple[int, int]] = []
+            for ri, row in enumerate(grid):
+                for ci, cell in enumerate(row):
+                    val = (cell or "").lower()
+                    if any(re.search(rf"\b{re.escape(t)}\b", val, re.I) for t in terms_l):
+                        hit_rc.append((ri, ci))
+            if not hit_rc:
+                return None
+
+            r0, c0 = hit_rc[0]
+            r1, c1 = r0, c0
+            r0 = max(0, r0 - rwin)
+            r1 = min(len(grid) - 1, r1 + rwin)
+
+            max_cols = max(len(row) for row in grid) if grid else 0
+            c0 = max(0, c0 - cwin)
+            c1 = min(
+                (len(grid[0]) - 1) if grid and grid[0] else max_cols - 1,
+                c1 + cwin,
+            )
+
+            header_row_idx = 0
+            if grid and not any((grid[0][ci] or "").strip() for ci in range(len(grid[0]))):
+                for rr in range(r0 - 1, -1, -1):
+                    if any((grid[rr][ci] or "").strip() for ci in range(len(grid[rr]))):
+                        header_row_idx = rr
                         break
-                if hit_rc is None:
-                    continue
 
-                ri, ci = hit_rc
-                c0 = max(0, ci - COL_WINDOW)
-                c1 = min(len(tbl[ri]) - 1, ci + COL_WINDOW)
+            # capture c0/c1 into defaults (avoid B023 closure on loop vars)
+            def slice_cols(row: list[str], _c0: int = c0, _c1: int = c1) -> list[str]:
+                return row[_c0 : _c1 + 1]
 
-                def slice_cols(row: list[str], _c0: int = c0, _c1: int = c1) -> list[str]:
-                    return row[_c0 : _c1 + 1]
+            sub_rows: list[list[str]] = []
+            for rr in range(max(header_row_idx, r0), r1 + 1):
+                row = grid[rr]
+                if len(row) <= c1:
+                    row = row + [""] * (c1 - len(row) + 1)
+                cells = [ _highlight_terms((row[cc] or "").strip(), terms) 
+                         for cc in range(c0, c1 + 1) ]
+                sub_rows.append(cells)
 
-                def td_cells(cells: list[str]) -> str:
-                    return "".join(
-                        f"<td>{_html_highlight(c or '', terms)}</td>"
-                        for c in cells
-                    )
+            def tr(cells: list[str], th: bool = False) -> str:
+                tag = "th" if th else "td"
+                return "<tr>" + "".join(f"<{tag}>{c}</{tag}>" for c in cells) + "</tr>"
 
-                thead = ""
-                if header:
-                    head_slice = slice_cols(header)
-                    thead = "<thead><tr>" + "".join(
-                        f"<th>{html.escape(c or '')}</th>"
-                        for c in head_slice
-                    ) + "</tr></thead>"
+            html_rows = []
+            if sub_rows:
+                html_rows.append(tr(sub_rows[0], th=True))
+                for r in sub_rows[1:]:
+                    html_rows.append(tr(r, th=False))
 
-                r0 = max(data_start, ri - 1)
-                r1 = min(len(tbl) - 1, ri + 1)
-                body_rows = []
-                for r in range(r0, r1 + 1):
-                    body_rows.append("<tr>" + td_cells(slice_cols(tbl[r])) + "</tr>")
-
-                html_tbl = "<table class='tbl'>" + thead + "<tbody>" + \
-                           "".join(body_rows) + "</tbody></table>"
-                return {"kind": "table", "html": html_tbl, "page": page}
+            x0, y0, x1, y1 = tb.bbox  # type: ignore[attr-defined]
+            return {
+                "kind": "table",
+                "table_html": (
+                    "<table class='snippet-table'>" + "".join(html_rows) + "</table>"
+                ),
+                "bbox": [float(x0), float(y0), float(x1), float(y1)],
+                "page": page_no + 1,
+            }
     except Exception:
         return None
 
@@ -315,6 +344,7 @@ def _auto_mode(q: str) -> str:
     return "ranked"
 
 # Routes
+
 @app.get("/", response_class=JSONResponse)
 def root_status():
     return {
@@ -327,7 +357,7 @@ def root_status():
 
 @app.get("/ui", response_class=HTMLResponse)
 def ui_page():
-    # Minimalist UI: dropzone + auto-index + per-file progress + single search box.
+    # Minimal UI: dropzone + per-file progress + one search box + simple cards.
     return HTMLResponse(
         """
 <!doctype html>
@@ -339,13 +369,13 @@ def ui_page():
   <style>
     :root {
       --bg:#0b0f18; --fg:#e7eaf2; --muted:#9aa3b2; --card:#131a27;
-      --accent:#2ea043; --mark:#fff59d;
+      --accent:#2ea043; --mark:#fff59d; --line:#2b3a55;
     }
     html,body{
       background:var(--bg); color:var(--fg);
-      font:16px/1.4 system-ui,Segoe UI,Roboto,Arial;
+      font:16px/1.45 system-ui,Segoe UI,Roboto,Arial;
     }
-    .wrap{max-width:920px;margin:32px auto;padding:0 16px;}
+    .wrap{max-width:960px;margin:32px auto;padding:0 16px;}
     h1{font-size:28px;margin:0 0 12px;}
     .sub{color:var(--muted);margin-bottom:16px}
     .zone{
@@ -355,7 +385,7 @@ def ui_page():
     .zone.drag{outline:2px solid #4b6cb7}
     .btn{
       background:#1f2937; color:var(--fg);
-      border:1px solid #2b3a55; border-radius:10px;
+      border:1px solid var(--line); border-radius:10px;
       padding:8px 12px; cursor:pointer
     }
     .btn.primary{background:#2ea043;border-color:#2ea043;color:#08110a}
@@ -363,17 +393,17 @@ def ui_page():
     .list{margin-top:10px}
     .file{
       display:flex; align-items:center; gap:10px; margin:8px 0; padding:8px;
-      border:1px solid #2b3a55; border-radius:10px; background:var(--card)
+      border:1px solid var(--line); border-radius:10px; background:var(--card)
     }
     progress{width:160px;height:10px}
     .controls{display:flex;gap:10px;margin:18px 0}
     input[type=text]{
       flex:1; min-width:0; background:#0e1420;
-      border:1px solid #2b3a55; border-radius:10px; padding:10px; color:var(--fg)
+      border:1px solid var(--line); border-radius:10px; padding:10px; color:var(--fg)
     }
     .card{
       margin:16px 0; padding:14px;
-      border:1px solid #2b3a55; border-radius:12px; background:var(--card)
+      border:1px solid var(--line); border-radius:12px; background:var(--card)
     }
     .doc{font-weight:700}
     .badge{
@@ -384,11 +414,15 @@ def ui_page():
       white-space:pre-wrap; background:#0e1420;
       border:1px solid #1d2a44; padding:10px; border-radius:10px
     }
-    table.tbl{border-collapse:collapse;border:1px solid #2b3a55;background:#0e1420}
-    table.tbl td, table.tbl th{
-      border:1px solid #2b3a55; padding:6px 8px
+    table.snippet-table{border-collapse:collapse;background:#0e1420}
+    table.snippet-table th, table.snippet-table td{
+      border:1px solid var(--line); padding:6px 8px
     }
     mark{background:var(--mark);color:#222}
+    .hit .body{display:flex; gap:16px; align-items:flex-start}
+    .hit .left{flex:1 1 60%;}
+    .hit .right{flex:0 0 auto}
+    .hit .right img{max-width:420px;border:1px solid var(--line);border-radius:8px}
   </style>
 </head>
 <body>
@@ -457,8 +491,8 @@ function fileRow(name) {
 
 function xhrUpload(files, row) {
   return new Promise((resolve, reject) => {
-    const form = new FormData();
-    for (const f of files) form.append('files', f);
+    const fd = new FormData();
+    for (const f of files) fd.append('files', f);
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/index-files');
     xhr.upload.onprogress = e => {
@@ -473,10 +507,10 @@ function xhrUpload(files, row) {
         row.querySelector('progress').value = 100;
         row.querySelector('span').textContent = 'indexed';
         resolve();
-      } else reject(new Error('Upload failed'));
+      } else reject(new Error('upload failed'));
     };
-    xhr.onerror = () => reject(new Error('Network error'));
-    xhr.send(form);
+    xhr.onerror = () => reject(new Error('network error'));
+    xhr.send(fd);
   });
 }
 
@@ -500,22 +534,18 @@ async function doSearch() {
     const ht = (rdoc.hits && rdoc.hits.length)
       ? `<span class="badge">${rdoc.hits.length} hit${rdoc.hits.length>1?'s':''}</span>`
       : '';
+    const hitHtml = (rdoc.hits||[]).map(h => {
+      if (h.kind === 'table') {
+        const snap = h.snapshot_url
+          ? `<div class="right"><img src="${h.snapshot_url}"/></div>` : '';
+        return `<div class="hit"><div class="left">${h.table_html}</div>${snap}</div>`;
+      }
+      return `<div class="hit"><div class="left">${h.snippet_html||''}</div></div>`;
+    }).join('');
     out.push(
       `<div class="card">
         <div class="doc">${rdoc.doc_id} ${sc} ${ht}</div>
-        ${(rdoc.hits||[]).map(h => {
-            const link = (h.page && rdoc.doc_id)
-              ? \`<div style="margin:6px 0">
-                   <a class="btn" target="_blank"
-                      href="/page-image?doc_id=\${encodeURIComponent(rdoc.doc_id)}
-                            &page=\${h.page}
-                            &q=\${encodeURIComponent(document.getElementById('q').value)}">
-                     Download page image
-                   </a>
-                 </div>\`
-              : '';
-            return (h.html || '') + link;
-          }).join('')}
+        ${hitHtml}
       </div>`
     );
   }
@@ -532,21 +562,21 @@ refreshState();
         """
     )
 
+# Indexing
 
-# ----------------- Indexing -----------------
 @app.post("/index", response_model=IndexOut)
 def index_docs(
     payload: Annotated[IndexIn, Body(...)],
     _auth: None = Depends(_check_auth),  # noqa: B008
 ) -> IndexOut:
-    """Index from raw JSON payload; replaces the current index."""
+    """Index from raw JSON (replaces current index)."""
     global _INDEX, _DOC_PATHS
     with _INDEX_LOCK:
         w = IndexWriter(_ANALYZER, index_stopwords=True)
         for d in payload.docs:
             w.add(d.id, d.text, page_map=d.page_map or None)
         _INDEX = w.commit()
-        _DOC_PATHS = {}  # json indexing doesn't carry files
+        _DOC_PATHS = {}
         return IndexOut(
             ok=True,
             indexed=len(_INDEX.doc_ids),
@@ -561,8 +591,8 @@ async def index_files(
 ) -> IndexOut:
     """
     Upload and index multiple files.
-    - PDFs: extract text & page_map with pdfplumber, store file paths for table extraction.
-    - TXTs: read as UTF-8 text.
+    - PDFs: extract text & page_map; remember file paths for table/snapshot.
+    - TXTs: read UTF-8 text.
     Index is replaced on each call.
     """
     if not files:
@@ -594,10 +624,9 @@ async def index_files(
     with _INDEX_LOCK:
         w = IndexWriter(_ANALYZER, index_stopwords=True)
         for name, _p, text, page_map in saved:
-            doc_id = os.path.splitext(name)[0]  # friendlier id (no extension)
+            doc_id = os.path.splitext(name)[0]  # nicer id: drop extension
             w.add(doc_id, text, page_map=page_map)
         _INDEX = w.commit()
-        # remember original file path by doc_id (for table extraction)
         _DOC_PATHS = {
             os.path.splitext(name)[0]: str(p)
             for name, p, _t, _pm in saved
@@ -609,15 +638,15 @@ async def index_files(
         vocab=_INDEX.vocabulary_size(),
     )
 
+#Seaching
 
-# ----------------- Search (auto mode) -----------------
 @app.get("/search", response_model=SearchOut)
 def search(
     q: Annotated[str, Query(min_length=1)],
     _auth: None = Depends(_check_auth),  # noqa: B008
 ) -> SearchOut:
     if _INDEX is None:
-        raise HTTPException(400, "Index empty. Upload files on /ui first.")
+        raise HTTPException(400, "Index empty. Upload on /ui first.")
 
     mode = _auto_mode(q)
     s = Searcher(_INDEX, _ANALYZER)
@@ -625,16 +654,21 @@ def search(
 
     if mode == "phrase":
         pm = PhraseMatcher(_INDEX, _ANALYZER)
-        hits = pm.match(q, keep_stopwords=True)  # keep stopwords to align positions
+        hits = pm.match(q, keep_stopwords=True)
         terms = _ANALYZER.tokenize(q, keep_stopwords=True)
         for doc_id in sorted(hits.keys()):
-            starts = hits[doc_id][:1]  # first hit per doc
+            starts = hits[doc_id][:1]  # one hit per doc for brevity
             out_hits: list[dict] = []
             for st in starts:
-                page = _page_of_pos(doc_id, st)
-                htab = _table_snippet(doc_id, page, terms)
-                if htab:
-                    out_hits.append(htab)
+                page = _page_of_pos(doc_id, st) or 1
+                table = _table_snippet(doc_id, page - 1, terms)
+                if table:
+                    table["snapshot_url"] = (
+                        f"/page-snapshot?doc_id={doc_id}&page={table['page']}"
+                        f"&x0={table['bbox'][0]}&y0={table['bbox'][1]}"
+                        f"&x1={table['bbox'][2]}&y1={table['bbox'][3]}"
+                    )
+                    out_hits.append(table)
                 else:
                     out_hits.append(_paragraph_snippet(doc_id, st, terms))
             results.append({"doc_id": doc_id, "hits": out_hits})
@@ -644,9 +678,15 @@ def search(
         terms = _ANALYZER.tokenize(q, keep_stopwords=False)
         for doc_id in docs:
             pos = _representative_pos(doc_id, terms)
-            page = _page_of_pos(doc_id, pos or 0)
-            htab = _table_snippet(doc_id, page, terms)
-            hit = htab or _paragraph_snippet(doc_id, pos, terms)
+            page = _page_of_pos(doc_id, pos or 0) or 1
+            table = _table_snippet(doc_id, page - 1, terms)
+            hit = table or _paragraph_snippet(doc_id, pos, terms)
+            if table:
+                hit["snapshot_url"] = (
+                    f"/page-snapshot?doc_id={doc_id}&page={table['page']}"
+                    f"&x0={table['bbox'][0]}&y0={table['bbox'][1]}"
+                    f"&x1={table['bbox'][2]}&y1={table['bbox'][3]}"
+                )
             results.append({"doc_id": doc_id, "hits": [hit]})
 
     else:  # ranked
@@ -654,55 +694,62 @@ def search(
         terms = _ANALYZER.tokenize(q, keep_stopwords=False)
         for doc_id, score in top:
             pos = _representative_pos(doc_id, terms)
-            page = _page_of_pos(doc_id, pos or 0)
-            htab = _table_snippet(doc_id, page, terms)
-            hit = htab or _paragraph_snippet(doc_id, pos, terms)
+            page = _page_of_pos(doc_id, pos or 0) or 1
+            table = _table_snippet(doc_id, page - 1, terms)
+            hit = table or _paragraph_snippet(doc_id, pos, terms)
+            if table:
+                hit["snapshot_url"] = (
+                    f"/page-snapshot?doc_id={doc_id}&page={table['page']}"
+                    f"&x0={table['bbox'][0]}&y0={table['bbox'][1]}"
+                    f"&x1={table['bbox'][2]}&y1={table['bbox'][3]}"
+                )
             results.append({"doc_id": doc_id, "score": float(score), "hits": [hit]})
 
     return SearchOut(results=results)
 
+# Page snapshot with highlight box (for tables)
 
-# Page image with highlight 
-@app.get("/page-image")
-def page_image(doc_id: str, page: int, q: str):
+@app.get("/page-snapshot")
+def page_snapshot(
+    doc_id: str,
+    page: int = Query(..., ge=1),
+    x0: float = Query(...),
+    y0: float = Query(...),
+    x1: float = Query(...),
+    y1: float = Query(...),
+):
     """
-    Render the original PDF page with yellow rectangles over matches.
+    Render the PDF page and draw a rectangle for the given bbox.
+    Coordinates are PDF points (same as pdfplumber's).
     """
-    pth = _DOC_PATHS.get(doc_id)
-    if not pth or not pth.lower().endswith(".pdf"):
-        raise HTTPException(400, "PDF not available for this document.")
+    path = _DOC_PATHS.get(doc_id)
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Original file not found.")
 
     try:
-        doc = fitz.open(pth)
-    except Exception as e:  # pragma: no cover - environment dependent
-        raise HTTPException(500, f"Open PDF failed: {e}") from e
+        doc = fitz.open(path)
+        pno = page - 1
+        if pno < 0 or pno >= doc.page_count:
+            raise HTTPException(400, "Invalid page.")
+        pg = doc[pno]
 
-    if not (1 <= page <= len(doc)):
-        raise HTTPException(400, "Invalid page number.")
+        pix = pg.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x for readability
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-    pg = doc[page - 1]
-    # collect rectangles for each term
-    rects = []
-    for term in [t for t in q.split() if t.strip()]:
-        try:
-            rects += pg.search_for(term)
-        except Exception:
-            continue
+        # map PDF coords -> pixels
+        rx, ry = pg.rect.width, pg.rect.height
+        sx = pix.width / rx
+        sy = pix.height / ry
+        box = (int(x0 * sx), int(y0 * sy), int(x1 * sx), int(y1 * sy))
 
-    # render
-    zoom = 2.0
-    mat = fitz.Matrix(zoom, zoom)
-    pm = pg.get_pixmap(matrix=mat, alpha=False)
-    img = Image.frombytes("RGB", [pm.width, pm.height], pm.samples)
+        draw = ImageDraw.Draw(img)
+        draw.rectangle(box, outline=(255, 204, 0), width=4)
 
-    if rects:
-        dr = ImageDraw.Draw(img)
-        for r in rects:
-            x0, y0 = r.x0 * zoom, r.y0 * zoom
-            x1, y1 = r.x1 * zoom, r.y1 * zoom
-            dr.rectangle((x0, y0, x1, y1), outline="yellow", width=3)
-
-    bio = io.BytesIO()
-    img.save(bio, format="PNG")
-    bio.seek(0)
-    return StreamingResponse(bio, media_type="image/png")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="image/png")
+    except HTTPException:
+        raise
+    except Exception as e:  # pragma: no cover
+        raise HTTPException(500, f"render failed: {e}") from e
