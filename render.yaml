@@ -7,7 +7,7 @@ services:
     buildCommand: |
       pip install -U pip
       pip install -e .
-      pip install fastapi uvicorn pdfminer.six python-multipart
+      pip install fastapi uvicorn pdfminer.six python-multipart pdfplumber
     startCommand: uvicorn evisearch.api:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: BASIC_USER

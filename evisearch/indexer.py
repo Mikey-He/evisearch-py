@@ -29,7 +29,7 @@ class InvertedIndex:
 
     page_map (optional):
         doc_id -> list[tuple[int, int]]
-        Sorted (pos0, page1) pairs; only present if paging is added later.
+        Each tuple is (token_pos_offset, page_number), sorted by token_pos_offset.
     """
 
     postings: dict[str, dict[str, list[int]]]
@@ -48,7 +48,10 @@ class InvertedIndex:
     @property
     def pos_to_line(self) -> dict[str, dict[int, int]]:
         """Compatibility shim: build {doc_id: {pos: line}} from line_of_pos."""
-        return {doc: {i: ln for i, ln in enumerate(lst)} for doc, lst in self.line_of_pos.items()}
+        return {
+            doc: {i: ln for i, ln in enumerate(lst)}
+            for doc, lst in self.line_of_pos.items()
+        }
 
 
 class IndexWriter:
@@ -65,7 +68,9 @@ class IndexWriter:
         self.index_stopwords = index_stopwords
 
         # term -> doc_id -> [positions...]
-        self._postings: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+        self._postings: dict[str, dict[str, list[int]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
         self._doc_lengths: dict[str, int] = {}
         self._doc_ids: list[str] = []
 
@@ -73,8 +78,21 @@ class IndexWriter:
         self._doc_lines: dict[str, list[str]] = {}
         self._line_of_pos: dict[str, list[int]] = {}
 
-    def add(self, doc_id: str, text: str) -> None:
-        """Add a single document. `doc_id` must be unique and contain no whitespace."""
+        # optional: token-pos -> page-number map per doc
+        self._page_map: dict[str, list[tuple[int, int]]] = {}
+
+    def add(
+        self,
+        doc_id: str,
+        text: str,
+        *,
+        page_map: list[tuple[int, int]] | None = None,
+    ) -> None:
+        """
+        Add a single document. `doc_id` must be unique and contain no whitespace.
+
+        If `page_map` is provided, it must be a sorted list of (pos, page).
+        """
         if not doc_id or any(c.isspace() for c in doc_id):
             raise ValueError("doc_id must be non-empty and contain no whitespace")
         if doc_id in self._doc_lengths:
@@ -93,7 +111,9 @@ class IndexWriter:
 
         for line_idx, line in enumerate(lines):
             # tokens for postings (may include stopwords)
-            for tok in self.analyzer.iter_tokens(line, keep_stopwords=self.index_stopwords):
+            for tok in self.analyzer.iter_tokens(
+                line, keep_stopwords=self.index_stopwords
+            ):
                 by_term[tok][doc_id].append(pos)
                 line_map.append(line_idx)
                 pos += 1
@@ -105,6 +125,11 @@ class IndexWriter:
         self._line_of_pos[doc_id] = line_map
         self._doc_lengths[doc_id] = doc_len_no_stop
         self._doc_ids.append(doc_id)
+
+        if page_map:
+            # Ensure sorted and unique by pos
+            pm_sorted = sorted(page_map, key=lambda t: t[0])
+            self._page_map[doc_id] = pm_sorted
 
     def commit(self) -> InvertedIndex:
         """Finalize the index: sort & de-dup each posting list, then freeze."""
@@ -127,4 +152,5 @@ class IndexWriter:
             doc_ids=list(self._doc_ids),
             doc_lines=dict(self._doc_lines),
             line_of_pos=dict(self._line_of_pos),
+            page_map=dict(self._page_map),
         )

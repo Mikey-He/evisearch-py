@@ -1,491 +1,708 @@
-# isort: skip_file
-# ruff: noqa: E501
 from __future__ import annotations
 
+import html
 import io
 import os
+import re
 import threading
-from collections.abc import Iterable
 from pathlib import Path
 from typing import Annotated
 
+import fitz  # PyMuPDF
+import pdfplumber
+from PIL import Image, ImageDraw
 from fastapi import Body, Depends, FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
 from .analyzer import Analyzer
-from .highlight import Context as Ctx, Highlighter
 from .indexer import IndexWriter, InvertedIndex
 from .searcher import PhraseMatcher, Searcher
-from .storage import load_index, save_index
+
 
 
 # App & global state
 
-app = FastAPI(title="EviSearch-Py", version="1.0.0")
+app = FastAPI(title="EviSearch-Py", version="1.2.0")
+
+DATA_DIR = Path("data")
+UPLOAD_DIR = DATA_DIR / "uploads"
+DATA_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 _ANALYZER = Analyzer()
 _INDEX_LOCK = threading.Lock()
 _INDEX: InvertedIndex | None = None
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-SNAPSHOT = DATA_DIR / "index.json"
+# doc_id -> absolute file path (only for uploaded PDFs/TXTs)
+_DOC_PATHS: dict[str, str] = {}
 
+# snippet/table windows
+LINES_WINDOW = 1  # text: hit line ±N lines
+COL_WINDOW = 1    # table: hit col ±N columns
 
-# Optional Basic Auth (enable by setting BASIC_USER/PASS)
+# ---------------------------------
+# Optional Basic Auth (BASIC_USER/PASS)
+# ---------------------------------
+basic_user = os.getenv("BASIC_USER") or ""
+basic_pass = os.getenv("BASIC_PASS") or ""
 security = HTTPBasic()
-_USER = os.getenv("BASIC_USER")
-_PASS = os.getenv("BASIC_PASS")
+
+def _needs_auth() -> bool:
+    return bool(basic_user and basic_pass)
 
 
-def _auth_enabled() -> bool:
-    return bool(_USER and _PASS)
-
-
-def require_auth(credentials: Annotated[HTTPBasicCredentials, Depends(security)]) -> None:
-    if not _auth_enabled():
+def _check_auth(credentials: HTTPBasicCredentials = Depends(security)) -> None:  # noqa: B008
+    if not _needs_auth():
         return
-    if credentials.username != _USER or credentials.password != _PASS:
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"},
-        )
+    ok = credentials.username == basic_user and credentials.password == basic_pass
+    if not ok:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-# Models
-
-
+# ---------------------------------
+# Pydantic I/O models (minimal)
+# ---------------------------------
 class DocIn(BaseModel):
-    id: str = Field(..., min_length=1)
+    id: str
     text: str
+    page_map: list[tuple[int, int]] = Field(default_factory=list)
 
 
 class IndexIn(BaseModel):
     docs: list[DocIn]
-    index_stopwords: bool = True
-
 
 class IndexOut(BaseModel):
     ok: bool
     indexed: int
-    docs: int
     vocab: int
 
-
-class SearchItem(BaseModel):
-    doc_id: str
-    score: float | None = None
-    snippet: str = ""
-    line: int = 0
-
-
 class SearchOut(BaseModel):
-    results: list[SearchItem]
+    results: list[dict]
 
 
-class Hit(BaseModel):
-    line: int
-    page: int | None = None
-    snippet: str
+# Utilities
+def _safe_doc_id(name: str) -> str:
+    base = os.path.basename(name)
+    base = re.sub(r"[^\w\-.]+", "_", base)
+    return base
 
 
-class DocGroup(BaseModel):
-    doc_id: str
-    score: float | None = None
-    hits: list[Hit]
+def _extract_pdf_text_and_page_map(
+    path: Path,
+) -> tuple[str, list[tuple[int, int]]]:
+    """
+    Use pdfplumber to extract text per page and compute a page_map
+    of (token_pos_offset, page_number) using stopword-inclusive tokenization.
+    """
+    texts: list[str] = []
+    page_map: list[tuple[int, int]] = []
+    pos = 0
+
+    with pdfplumber.open(str(path)) as pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            txt = page.extract_text() or ""
+            texts.append(txt)
+            # token count for this page (keep stopwords = True to align positions)
+            page_tokens = list(_ANALYZER.iter_tokens(txt, keep_stopwords=True))
+            page_map.append((pos, i))
+            pos += len(page_tokens)
+
+    joined = "\n\n".join(texts)  # keep pages separated by a blank line
+    return joined, page_map
 
 
-class SearchXOut(BaseModel):
-    groups: list[DocGroup]
-
-
-# Helpers
-def _require_index() -> InvertedIndex:
+def _page_of_pos(doc_id: str, pos: int) -> int | None:
     if _INDEX is None:
-        raise HTTPException(
-            status_code=400, detail="No index in memory. POST /index or /index-files first."
-        )
-    return _INDEX
+        return None
+    pm = _INDEX.page_map.get(doc_id)
+    if not pm:
+        return None
+    page = None
+    for start_pos, pg in pm:
+        if start_pos <= pos:
+            page = pg
+        else:
+            break
+    return page
 
 
-def _first_hit_pos(index: InvertedIndex, terms: Iterable[str], doc_id: str) -> int | None:
-    """First global token position in doc where ANY term occurs."""
-    best: int | None = None
+def _representative_pos(doc_id: str, terms: list[str]) -> int | None:
+    """Pick the earliest occurrence position of any query term in the doc."""
+    if _INDEX is None:
+        return None
+    best = None
     for t in terms:
-        posting = index.get_posting(t)
+        posting = _INDEX.get_posting(t)
         if not posting:
             continue
-        positions = posting.get(doc_id)
-        if not positions:
-            continue
-        pos0 = positions[0]
-        if best is None or pos0 < best:
-            best = pos0
+        plist = posting.get(doc_id, [])
+        if plist:
+            cand = plist[0]
+            if best is None or cand < best:
+                best = cand
     return best
 
 
-def _extract_text_from_upload(up: UploadFile) -> tuple[str, str]:
+def _html_highlight(text: str, terms: list[str]) -> str:
+    """Escape HTML, then wrap any of the terms with <mark> (case-insensitive)."""
+    esc = html.escape(text)
+    if not terms:
+        return esc
+    pats = sorted(set(t for t in terms if t), key=len, reverse=True)
+    pattern = "(" + "|".join(re.escape(t) for t in pats) + ")"
+    rx = re.compile(pattern, re.IGNORECASE)
+    return rx.sub(r"<mark>\\1</mark>", esc)
+
+
+def _paragraph_snippet(doc_id: str, start_pos: int | None, terms: list[str]) -> dict:
     """
-    Read an UploadFile and return (doc_id, text).
-    - .txt: decode as utf-8
-    - .pdf: use pdfminer.six to extract text (in-memory)
+    Build a line-window snippet around the hit line: [hit-LINES_WINDOW, hit+LINES_WINDOW].
     """
-    name = (up.filename or "doc").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-    base = name.rsplit(".", 1)[0] or "doc"
-    raw = up.file.read()
+    if _INDEX is None or start_pos is None:
+        return {"kind": "text", "html": "", "line": 0, "page": None}
 
-    ctype = (up.content_type or "").lower()
-    is_pdf = ctype == "application/pdf" or name.lower().endswith(".pdf")
+    lines = _INDEX.doc_lines.get(doc_id, [])
+    line_of_pos = _INDEX.line_of_pos.get(doc_id, [])
+    if not lines or not line_of_pos or start_pos >= len(line_of_pos):
+        return {"kind": "text", "html": "", "line": 0, "page": None}
 
-    if is_pdf:
-        try:
-            from pdfminer.high_level import extract_text  # lazy import
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"pdfminer.six not installed or failed to import: {e}",
-            ) from None
-        try:
-            text = extract_text(io.BytesIO(raw)) or ""
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to parse PDF: {e}") from None
-        return (base, text)
+    hit = line_of_pos[start_pos]
+    s = max(0, hit - LINES_WINDOW)
+    e = min(len(lines) - 1, hit + LINES_WINDOW)
+    block = "\n".join(lines[s : e + 1])
 
-    # treat as plain text
+    page = _page_of_pos(doc_id, start_pos)
+    html_block = "<pre class='snippet'>" + _html_highlight(block, terms) + "</pre>"
+    return {"kind": "text", "html": html_block, "line": hit + 1, "page": page}
+
+
+def _is_numericish(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return False
+    return bool(re.fullmatch(r"[+-]?\d[\d,]*(\.\d+)?%?", s))
+
+
+def _guess_header_row(tbl: list[list[str]]) -> int | None:
+    """
+    Choose a row that looks like header:
+    - If first row has letters and not all cells are numeric -> header
+    - Else among first 5 rows, pick the one with more non-numeric & letter ratio
+    """
+    if not tbl:
+        return None
+
+    def alpha_ratio(row: list[str]) -> float:
+        txt = " ".join(c or "" for c in row)
+        letters = sum(ch.isalpha() for ch in txt)
+        return letters / max(1, len(txt))
+
+    first = tbl[0]
+    if any((c and any(ch.isalpha() for ch in c)) for c in first) and \
+       not all(_is_numericish(c) for c in first):
+        return 0
+
+    scores = []
+    for i, row in enumerate(tbl[:5]):
+        non_num = sum(not _is_numericish(c) for c in row)
+        scores.append((non_num, alpha_ratio(row), i))
+    scores.sort(reverse=True)
+    best_nonnum, best_alpha, idx = scores[0]
+    if best_nonnum == 0 and best_alpha < 0.05:
+        return None
+    return idx
+
+
+def _table_snippet(doc_id: str, page: int | None, terms: list[str]) -> dict | None:
+    """
+    Try to extract a table window:
+    - smart header detection
+    - find hit cell (ri, ci)
+    - return subtable: rows near hit and columns near hit
+    """
+    if page is None:
+        return None
+    pth = _DOC_PATHS.get(doc_id)
+    if not pth or not pth.lower().endswith(".pdf"):
+        return None
+
     try:
-        text = raw.decode("utf-8", errors="ignore")
+        with pdfplumber.open(pth) as pdf:
+            if not (1 <= page <= len(pdf.pages)):
+                return None
+            pg = pdf.pages[page - 1]
+            tables = pg.extract_tables()
+            if not tables:
+                return None
+
+            terms_l = [t.lower() for t in terms if t]
+            for raw in tables:
+                tbl = [
+                    [
+                        c if isinstance(c, str) else ("" if c is None else str(c))
+                        for c in row
+                    ]
+                    for row in raw
+                ]
+                if not tbl:
+                    continue
+
+                header_idx = _guess_header_row(tbl)
+                data_start = (header_idx + 1) if header_idx is not None else 0
+                header = tbl[header_idx] if header_idx is not None else []
+
+                # locate hit cell
+                hit_rc = None
+                for ri in range(data_start, len(tbl)):
+                    row_text = " | ".join(tbl[ri]).lower()
+                    if any(t in row_text for t in terms_l):
+                        best_ci = 0
+                        for ci, cell in enumerate(tbl[ri]):
+                            if any(t in (cell or "").lower() for t in terms_l):
+                                best_ci = ci
+                                break
+                        hit_rc = (ri, best_ci)
+                        break
+                if hit_rc is None:
+                    continue
+
+                ri, ci = hit_rc
+                c0 = max(0, ci - COL_WINDOW)
+                c1 = min(len(tbl[ri]) - 1, ci + COL_WINDOW)
+
+                def slice_cols(row: list[str], _c0: int = c0, _c1: int = c1) -> list[str]:
+                    return row[_c0 : _c1 + 1]
+
+                def td_cells(cells: list[str]) -> str:
+                    return "".join(
+                        f"<td>{_html_highlight(c or '', terms)}</td>"
+                        for c in cells
+                    )
+
+                thead = ""
+                if header:
+                    head_slice = slice_cols(header)
+                    thead = "<thead><tr>" + "".join(
+                        f"<th>{html.escape(c or '')}</th>"
+                        for c in head_slice
+                    ) + "</tr></thead>"
+
+                r0 = max(data_start, ri - 1)
+                r1 = min(len(tbl) - 1, ri + 1)
+                body_rows = []
+                for r in range(r0, r1 + 1):
+                    body_rows.append("<tr>" + td_cells(slice_cols(tbl[r])) + "</tr>")
+
+                html_tbl = "<table class='tbl'>" + thead + "<tbody>" + \
+                           "".join(body_rows) + "</tbody></table>"
+                return {"kind": "table", "html": html_tbl, "page": page}
     except Exception:
-        text = ""
-    return (base, text)
+        return None
+
+    return None
 
 
-# Startup: try to load existing snapshot (best-effort)
-@app.on_event("startup")
-def _load_snapshot() -> None:
-    global _INDEX
-    try:
-        if SNAPSHOT.exists():
-            _INDEX = load_index(SNAPSHOT)
-    except Exception as e:  # non-critical
-        print(f"[warn] failed to load index snapshot: {e}")
-
+def _auto_mode(q: str) -> str:
+    q2 = q.strip()
+    if not q2:
+        return "ranked"
+    if '"' in q2 or "'" in q2:
+        return "phrase"
+    if re.search(r"\b(and|or|not)\b|\(|\)", q2, re.IGNORECASE):
+        return "boolean"
+    return "ranked"
 
 # Routes
-@app.get("/")
-def root() -> dict[str, str | int]:
-    idx = _INDEX
+@app.get("/", response_class=JSONResponse)
+def root_status():
     return {
         "app": "EviSearch-Py",
-        "docs": 0 if idx is None else len(idx.doc_ids),
-        "vocab": 0 if idx is None else idx.vocabulary_size(),
-        "auth": "on" if _auth_enabled() else "off",
+        "docs": len(_INDEX.doc_ids) if _INDEX else 0,
+        "vocab": _INDEX.vocabulary_size() if _INDEX else 0,
+        "auth": "on" if _needs_auth() else "off",
     }
 
 
-@app.post("/index", response_model=IndexOut)
-def post_index(
-    _: Annotated[None, Depends(require_auth)],
-    payload: Annotated[IndexIn, Body(...)],
-) -> IndexOut:
-    global _INDEX
-    if not payload.docs:
-        raise HTTPException(status_code=400, detail="No docs provided.")
-
-    writer = IndexWriter(_ANALYZER, index_stopwords=payload.index_stopwords)
-    for d in payload.docs:
-        writer.add(d.id, d.text)
-    idx = writer.commit()
-
-    with _INDEX_LOCK:
-        _INDEX = idx
-    # best-effort snapshot (optional)
-    try:
-        save_index(idx, SNAPSHOT)
-    except Exception as e:
-        print(f"[warn] failed to save index snapshot: {e}")
-
-    return IndexOut(
-        ok=True, indexed=len(payload.docs), docs=len(idx.doc_ids), vocab=idx.vocabulary_size()
-    )
-
-
-@app.post("/index-files", response_model=IndexOut)
-def post_index_files(
-    _: Annotated[None, Depends(require_auth)],
-    files: Annotated[list[UploadFile], File(...)],
-) -> IndexOut:
-    """
-    Upload .pdf or .txt files and build in-memory index.
-    This replaces any previous index.
-    """
-    global _INDEX
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded.")
-
-    docs: list[DocIn] = []
-    for f in files:
-        doc_id, text = _extract_text_from_upload(f)
-        if not text.strip():
-            continue
-        docs.append(DocIn(id=doc_id, text=text))
-
-    if not docs:
-        raise HTTPException(status_code=400, detail="All uploaded files were empty/unreadable.")
-
-    writer = IndexWriter(_ANALYZER, index_stopwords=True)
-    for d in docs:
-        writer.add(d.id, d.text)
-    idx = writer.commit()
-
-    with _INDEX_LOCK:
-        _INDEX = idx
-    # best-effort snapshot (optional)
-    try:
-        save_index(idx, SNAPSHOT)
-    except Exception as e:
-        print(f"[warn] failed to save index snapshot: {e}")
-
-    return IndexOut(ok=True, indexed=len(docs), docs=len(idx.doc_ids), vocab=idx.vocabulary_size())
-
-
-@app.get("/search", response_model=SearchOut)
-def get_search(
-    _: Annotated[None, Depends(require_auth)],
-    q: Annotated[str, Query(min_length=1, description="Query string")],
-    k: Annotated[int, Query(ge=1, le=100, description="Top-K for ranked mode")] = 10,
-    mode: Annotated[str, Query(pattern="^(ranked|boolean|phrase)$")] = "ranked",
-) -> SearchOut:
-    """
-    Legacy search endpoint (kept for compatibility). For richer context/grouping, use /searchx.
-    """
-    idx = _require_index()
-    s = Searcher(idx, _ANALYZER)
-    hi = Highlighter(idx)
-
-    if mode == "boolean":
-        doc_ids = s.search_boolean(q)
-        terms = _ANALYZER.tokenize(q, keep_stopwords=False)
-        bool_items: list[SearchItem] = []
-        for d in doc_ids:
-            pos = _first_hit_pos(idx, terms, d)
-            snippet, line = hi.build_snippet(d, pos) if pos is not None else ("", 0)
-            bool_items.append(SearchItem(doc_id=d, snippet=snippet, line=line))
-        return SearchOut(results=bool_items)
-
-    if mode == "phrase":
-        pm = PhraseMatcher(idx, _ANALYZER)
-        hits = pm.match(q, keep_stopwords=True)
-        phrase_items: list[SearchItem] = []
-        for d in sorted(hits.keys()):
-            start = hits[d][0]
-            snippet, line = hi.build_snippet(d, start)
-            phrase_items.append(SearchItem(doc_id=d, snippet=snippet, line=line))
-        return SearchOut(results=phrase_items)
-
-    # ranked (BM25)
-    results = s.search_ranked(q, k=k)
-    terms = _ANALYZER.tokenize(q, keep_stopwords=False)
-    ranked_items: list[SearchItem] = []
-    for d, score in results:
-        pos = _first_hit_pos(idx, terms, d)
-        snippet, line = hi.build_snippet(d, pos) if pos is not None else ("", 0)
-        ranked_items.append(SearchItem(doc_id=d, score=score, snippet=snippet, line=line))
-    return SearchOut(results=ranked_items)
-
-
-@app.get("/searchx", response_model=SearchXOut)
-def get_searchx(
-    _: Annotated[None, Depends(require_auth)],
-    q: Annotated[str, Query(min_length=1, description="Query string")],
-    mode: Annotated[str, Query(pattern="^(ranked|phrase|boolean)$")] = "ranked",
-    k: Annotated[int, Query(ge=1, le=100)] = 10,  # ranked mode
-    context: Annotated[str, Query(pattern="^(paragraph|window)$")] = "paragraph",
-    window: Annotated[int, Query(ge=0, le=10)] = 2,  # when context=window
-    per_doc: Annotated[int, Query(ge=1, le=10)] = 3,  # hits per document
-    group_by_doc: bool = True,  # reserved for future
-) -> SearchXOut:
-    """
-    Rich search endpoint: returns multiple context blocks per document, grouped by doc.
-    """
-    # Mark as used to satisfy linters while keeping API parameter name stable
-    _ = group_by_doc
-
-    idx = _require_index()
-    s = Searcher(idx, _ANALYZER)
-    hi = Highlighter(idx)
-
-    def _ctx(doc_id: str, start_pos: int) -> Hit:
-        c: Ctx = hi.build_context(doc_id, start_pos, mode=context, window=window)
-        return Hit(line=c.line, page=c.page, snippet=c.snippet)
-
-    groups: list[DocGroup] = []
-
-    if mode == "phrase":
-        pm = PhraseMatcher(idx, _ANALYZER)
-        hits = pm.match(q, keep_stopwords=True)  # dict[doc_id] -> [start_pos...]
-        for d in sorted(hits.keys()):
-            chosen = hits[d][:per_doc]
-            groups.append(DocGroup(doc_id=d, score=None, hits=[_ctx(d, p) for p in chosen]))
-        return SearchXOut(groups=groups)
-
-    if mode == "boolean":
-        doc_ids = s.search_boolean(q)
-        terms = _ANALYZER.tokenize(q, keep_stopwords=False)
-        for d in doc_ids:
-            pos_candidates: list[int] = []
-            for t in terms:
-                posting = idx.get_posting(t)
-                if posting and d in posting and posting[d]:
-                    pos_candidates.append(posting[d][0])
-            pos_chosen = sorted(set(pos_candidates))[:per_doc]
-            if not pos_chosen:
-                continue
-            groups.append(DocGroup(doc_id=d, score=None, hits=[_ctx(d, p) for p in pos_chosen]))
-        return SearchXOut(groups=groups)
-
-    # ranked (BM25)
-    ranked = s.search_ranked(q, k=k)  # list[(doc_id, score)]
-    terms = _ANALYZER.tokenize(q, keep_stopwords=False)
-    for d, score in ranked:
-        pos_candidates: list[int] = []
-        for t in terms:
-            posting = idx.get_posting(t)
-            if posting and d in posting and posting[d]:
-                pos_candidates.append(posting[d][0])
-        pos_chosen = sorted(set(pos_candidates))[:per_doc]
-        if not pos_chosen:
-            continue
-        groups.append(DocGroup(doc_id=d, score=score, hits=[_ctx(d, p) for p in pos_chosen]))
-    return SearchXOut(groups=groups)
-
-
-# Minimal Web UI (improved)
-_HTML = """
+@app.get("/ui", response_class=HTMLResponse)
+def ui_page():
+    # Minimalist UI: dropzone + auto-index + per-file progress + single search box.
+    return HTMLResponse(
+        """
 <!doctype html>
-<html lang="en">
+<html>
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>EviSearch-Py</title>
-<style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:980px;margin:28px auto;padding:0 16px}
-h1{font-size:22px;margin:0 0 8px}
-small,.muted{color:#666}
-.card{border:1px solid #e5e7eb;border-radius:14px;padding:14px 16px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.03)}
-.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-input[type="text"]{flex:1;min-width:280px;padding:10px;border:1px solid #ddd;border-radius:10px}
-select,button{padding:10px;border-radius:10px;border:1px solid #ddd;background:#fff;cursor:pointer}
-button.primary{background:#111;color:#fff;border-color:#111}
-.badge{display:inline-block;border:1px solid #ddd;border-radius:999px;padding:2px 8px;font-size:12px;margin-left:8px;color:#555}
-.doc{font-weight:600}
-.snip{white-space:pre-wrap;background:#fafafa;border:1px dashed #eee;border-radius:10px;padding:10px;margin-top:8px}
-.hr{height:1px;background:linear-gradient(90deg,#eee,#f9f9f9);margin:8px 0}
-.ok{color:#0a7}.err{color:#c33}
-</style>
+  <meta charset="utf-8"/>
+  <title>EviSearch-Py</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    :root {
+      --bg:#0b0f18; --fg:#e7eaf2; --muted:#9aa3b2; --card:#131a27;
+      --accent:#2ea043; --mark:#fff59d;
+    }
+    html,body{
+      background:var(--bg); color:var(--fg);
+      font:16px/1.4 system-ui,Segoe UI,Roboto,Arial;
+    }
+    .wrap{max-width:920px;margin:32px auto;padding:0 16px;}
+    h1{font-size:28px;margin:0 0 12px;}
+    .sub{color:var(--muted);margin-bottom:16px}
+    .zone{
+      border:2px dashed #30405c; border-radius:14px; padding:18px;
+      display:flex; gap:12px; align-items:center; background:var(--card)
+    }
+    .zone.drag{outline:2px solid #4b6cb7}
+    .btn{
+      background:#1f2937; color:var(--fg);
+      border:1px solid #2b3a55; border-radius:10px;
+      padding:8px 12px; cursor:pointer
+    }
+    .btn.primary{background:#2ea043;border-color:#2ea043;color:#08110a}
+    .muted{color:var(--muted)}
+    .list{margin-top:10px}
+    .file{
+      display:flex; align-items:center; gap:10px; margin:8px 0; padding:8px;
+      border:1px solid #2b3a55; border-radius:10px; background:var(--card)
+    }
+    progress{width:160px;height:10px}
+    .controls{display:flex;gap:10px;margin:18px 0}
+    input[type=text]{
+      flex:1; min-width:0; background:#0e1420;
+      border:1px solid #2b3a55; border-radius:10px; padding:10px; color:var(--fg)
+    }
+    .card{
+      margin:16px 0; padding:14px;
+      border:1px solid #2b3a55; border-radius:12px; background:var(--card)
+    }
+    .doc{font-weight:700}
+    .badge{
+      font-size:12px; color:#0b2913; background:#1c4e2f;
+      border:1px solid #2ea043; padding:1px 6px; border-radius:999px
+    }
+    pre.snippet{
+      white-space:pre-wrap; background:#0e1420;
+      border:1px solid #1d2a44; padding:10px; border-radius:10px
+    }
+    table.tbl{border-collapse:collapse;border:1px solid #2b3a55;background:#0e1420}
+    table.tbl td, table.tbl th{
+      border:1px solid #2b3a55; padding:6px 8px
+    }
+    mark{background:var(--mark);color:#222}
+  </style>
 </head>
 <body>
-<h1>EviSearch-Py</h1>
-<div class="muted">Upload PDFs/TXT, then search (ranked / phrase / boolean). Context can be paragraph or ±N lines.</div>
-
-<div class="card">
-  <div class="row">
-    <input id="files" type="file" multiple accept=".pdf,.txt">
-    <button class="primary" id="btnIndex">Index files</button>
-    <span id="idxMsg" class="muted"></span>
+<div class="wrap">
+  <h1>EviSearch-Py</h1>
+  <div class="sub">
+    Drop PDFs/TXT here. Files index automatically. Then search (auto mode).
   </div>
-  <small>Index is stored in memory; uploading again will replace the current index.</small>
-</div>
 
-<div class="card">
-  <div class="row">
-    <input id="q" type="text" placeholder='e.g. pue OR "power usage effectiveness"'>
-    <select id="mode">
-      <option value="ranked" selected>ranked (BM25)</option>
-      <option value="phrase">phrase (exact)</option>
-      <option value="boolean">boolean</option>
-    </select>
-    <select id="context">
-      <option value="paragraph" selected>paragraph</option>
-      <option value="window">±N lines</option>
-    </select>
-    <select id="window">
-      <option>0</option><option>1</option><option selected>2</option><option>3</option><option>5</option>
-    </select>
-    <select id="perdoc">
-      <option>1</option><option selected>3</option><option>5</option>
-    </select>
-    <select id="k">
-      <option>5</option><option selected>10</option><option>20</option>
-    </select>
-    <button class="primary" id="btnSearch">Search</button>
-    <span id="searchMsg" class="muted"></span>
+  <div id="zone" class="zone">
+    <input id="pick" type="file" multiple style="display:none"/>
+    <button class="btn" id="choose">Choose files</button>
+    <div class="muted">or drag files into this area…</div>
+    <div id="state" class="muted" style="margin-left:auto">docs: 0, vocab: 0</div>
   </div>
+  <div id="files" class="list"></div>
+
+  <div class="controls">
+    <input id="q" type="text"
+      placeholder="Search (e.g., pue or &quot;power usage effectiveness&quot;)" />
+    <button class="btn primary" id="go">Search</button>
+  </div>
+
   <div id="results"></div>
 </div>
 
 <script>
-const $ = (id)=>document.getElementById(id);
+const zone = document.getElementById('zone');
+const pick = document.getElementById('pick');
+const choose = document.getElementById('choose');
+const filesDiv = document.getElementById('files');
+const stateEl = document.getElementById('state');
+const q = document.getElementById('q');
+const go = document.getElementById('go');
+const results = document.getElementById('results');
 
-$("btnIndex").onclick = async () => {
-  const files = $("files").files;
-  if (!files.length) { $("idxMsg").textContent = "Choose files"; return; }
-  $("idxMsg").textContent = "Indexing...";
-  const fd = new FormData();
-  for (const f of files) fd.append("files", f);
-  try {
-    const r = await fetch("/index-files", { method:"POST", body: fd });
-    const j = await r.json();
-    $("idxMsg").innerHTML = r.ok
-      ? `<span class="ok">OK</span> indexed=${j.indexed}, vocab=${j.vocab}`
-      : `<span class="err">Error:</span> ${j.detail||JSON.stringify(j)}`;
-  } catch (e) {
-    $("idxMsg").innerHTML = `<span class="err">Network error</span>`;
-  }
-};
+choose.onclick = () => pick.click();
 
-$("btnSearch").onclick = async () => {
-  const q = $("q").value.trim();
-  if (!q) { $("searchMsg").textContent = "Enter a query"; return; }
-  $("searchMsg").textContent = "Searching...";
-  const url = new URL("/searchx", location.origin);
-  url.searchParams.set("q", q);
-  url.searchParams.set("mode", $("mode").value);
-  url.searchParams.set("context", $("context").value);
-  url.searchParams.set("window", $("window").value);
-  url.searchParams.set("per_doc", $("perdoc").value);
-  url.searchParams.set("group_by_doc", "true");
-  url.searchParams.set("k", $("k").value);
-  try {
-    const r = await fetch(url);
-    const j = await r.json();
-    $("searchMsg").textContent = "";
-    if (!r.ok) { $("results").innerHTML = `<div class="err">Error: ${j.detail||JSON.stringify(j)}</div>`; return; }
-    if (!j.groups.length) { $("results").innerHTML = `<div class="muted">No results</div>`; return; }
-    $("results").innerHTML = j.groups.map(g => `
-      <div class="card">
-        <div class="doc">${g.doc_id}
-          ${g.score!=null?`<span class="badge">score ${g.score.toFixed(3)}</span>`:""}
-          ${g.hits?.length?`<span class="badge">${g.hits.length} hit${g.hits.length>1?"s":""}</span>`:""}
-        </div>
-        <div class="hr"></div>
-        ${g.hits.map(h => `
-          <div class="muted">line ${h.line}${h.page?`, page ${h.page}`:""}</div>
-          <div class="snip">${(h.snippet||"").replace(/</g,"&lt;")}</div>
-        `).join("")}
-      </div>`).join("");
-  } catch (e) {
-    $("results").innerHTML = `<div class="err">Network error</div>`;
+['dragenter','dragover'].forEach(ev => zone.addEventListener(ev, e => {
+  e.preventDefault(); e.stopPropagation(); zone.classList.add('drag');
+}));
+['dragleave','drop'].forEach(ev => zone.addEventListener(ev, e => {
+  e.preventDefault(); e.stopPropagation(); zone.classList.remove('drag');
+}));
+zone.addEventListener('drop', e => {
+  const files = e.dataTransfer.files;
+  if (files && files.length) startIndex(files);
+});
+pick.addEventListener('change', () => {
+  if (pick.files && pick.files.length) startIndex(pick.files);
+});
+
+async function refreshState() {
+  const r = await fetch('/', {cache:'no-store'});
+  const j = await r.json();
+  stateEl.textContent = `docs: ${j.docs}, vocab: ${j.vocab}`;
+}
+
+function fileRow(name) {
+  const row = document.createElement('div'); row.className = 'file';
+  row.innerHTML =
+    `<div>${name}</div><progress value="0" max="100"></progress>
+     <span class="muted">waiting</span>`;
+  return row;
+}
+
+function xhrUpload(files, row) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    for (const f of files) form.append('files', f);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/index-files');
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable) {
+        const p = Math.round((e.loaded / e.total) * 100);
+        row.querySelector('progress').value = p;
+        row.querySelector('span').textContent = `upload ${p}%`;
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        row.querySelector('progress').value = 100;
+        row.querySelector('span').textContent = 'indexed';
+        resolve();
+      } else reject(new Error('Upload failed'));
+    };
+    xhr.onerror = () => reject(new Error('Network error'));
+    xhr.send(form);
+  });
+}
+
+async function startIndex(fileList) {
+  const fs = Array.from(fileList);
+  if (!fs.length) return;
+  const nameList = fs.map(f => f.name).join(', ');
+  const row = fileRow(nameList); filesDiv.prepend(row);
+  try { await xhrUpload(fs, row); await refreshState(); }
+  catch (e) { row.querySelector('span').textContent = 'error'; console.error(e); }
+}
+
+async function doSearch() {
+  results.innerHTML = '<div class="muted">Searching…</div>';
+  const r = await fetch('/search?q=' + encodeURIComponent(q.value));
+  const j = await r.json();
+  const out = [];
+  for (const rdoc of j.results) {
+    const sc = (rdoc.score !== undefined)
+      ? `<span class="badge">score ${rdoc.score.toFixed(3)}</span>` : '';
+    const ht = (rdoc.hits && rdoc.hits.length)
+      ? `<span class="badge">${rdoc.hits.length} hit${rdoc.hits.length>1?'s':''}</span>`
+      : '';
+    out.push(
+      `<div class="card">
+        <div class="doc">${rdoc.doc_id} ${sc} ${ht}</div>
+        ${(rdoc.hits||[]).map(h => {
+            const link = (h.page && rdoc.doc_id)
+              ? \`<div style="margin:6px 0">
+                   <a class="btn" target="_blank"
+                      href="/page-image?doc_id=\${encodeURIComponent(rdoc.doc_id)}
+                            &page=\${h.page}
+                            &q=\${encodeURIComponent(document.getElementById('q').value)}">
+                     Download page image
+                   </a>
+                 </div>\`
+              : '';
+            return (h.html || '') + link;
+          }).join('')}
+      </div>`
+    );
   }
-};
+  results.innerHTML = out.join('') || '<div class="muted">No results.</div>';
+}
+
+go.onclick = doSearch;
+q.addEventListener('keydown', (e)=>{ if (e.key === 'Enter') doSearch(); });
+
+refreshState();
 </script>
 </body>
 </html>
-"""
+        """
+    )
 
 
-@app.get("/ui", response_class=HTMLResponse)
-def ui(_: Annotated[None, Depends(require_auth)]) -> HTMLResponse:
-    return HTMLResponse(_HTML)
+# ----------------- Indexing -----------------
+@app.post("/index", response_model=IndexOut)
+def index_docs(
+    payload: Annotated[IndexIn, Body(...)],
+    _auth: None = Depends(_check_auth),  # noqa: B008
+) -> IndexOut:
+    """Index from raw JSON payload; replaces the current index."""
+    global _INDEX, _DOC_PATHS
+    with _INDEX_LOCK:
+        w = IndexWriter(_ANALYZER, index_stopwords=True)
+        for d in payload.docs:
+            w.add(d.id, d.text, page_map=d.page_map or None)
+        _INDEX = w.commit()
+        _DOC_PATHS = {}  # json indexing doesn't carry files
+        return IndexOut(
+            ok=True,
+            indexed=len(_INDEX.doc_ids),
+            vocab=_INDEX.vocabulary_size(),
+        )
+
+
+@app.post("/index-files", response_model=IndexOut)
+async def index_files(
+    files: list[UploadFile] = File(...),  # noqa: B008
+    _auth: None = Depends(_check_auth),  # noqa: B008
+) -> IndexOut:
+    """
+    Upload and index multiple files.
+    - PDFs: extract text & page_map with pdfplumber, store file paths for table extraction.
+    - TXTs: read as UTF-8 text.
+    Index is replaced on each call.
+    """
+    if not files:
+        raise HTTPException(400, "No files")
+
+    saved: list[tuple[str, Path, str, list[tuple[int, int]]]] = []
+    for f in files:
+        data = await f.read()
+        if not data:
+            continue
+        name = _safe_doc_id(f.filename or "doc")
+        path_out = UPLOAD_DIR / name
+        path_out.write_bytes(data)
+
+        if name.lower().endswith(".pdf"):
+            text, page_map = _extract_pdf_text_and_page_map(path_out)
+        else:
+            try:
+                text = data.decode("utf-8", errors="ignore")
+            except Exception:
+                text = ""
+            page_map = []
+        saved.append((name, path_out, text, page_map))
+
+    if not saved:
+        raise HTTPException(400, "Empty files")
+
+    global _INDEX, _DOC_PATHS
+    with _INDEX_LOCK:
+        w = IndexWriter(_ANALYZER, index_stopwords=True)
+        for name, _p, text, page_map in saved:
+            doc_id = os.path.splitext(name)[0]  # friendlier id (no extension)
+            w.add(doc_id, text, page_map=page_map)
+        _INDEX = w.commit()
+        # remember original file path by doc_id (for table extraction)
+        _DOC_PATHS = {
+            os.path.splitext(name)[0]: str(p)
+            for name, p, _t, _pm in saved
+        }
+
+    return IndexOut(
+        ok=True,
+        indexed=len(_INDEX.doc_ids),
+        vocab=_INDEX.vocabulary_size(),
+    )
+
+
+# ----------------- Search (auto mode) -----------------
+@app.get("/search", response_model=SearchOut)
+def search(
+    q: Annotated[str, Query(min_length=1)],
+    _auth: None = Depends(_check_auth),  # noqa: B008
+) -> SearchOut:
+    if _INDEX is None:
+        raise HTTPException(400, "Index empty. Upload files on /ui first.")
+
+    mode = _auto_mode(q)
+    s = Searcher(_INDEX, _ANALYZER)
+    results: list[dict] = []
+
+    if mode == "phrase":
+        pm = PhraseMatcher(_INDEX, _ANALYZER)
+        hits = pm.match(q, keep_stopwords=True)  # keep stopwords to align positions
+        terms = _ANALYZER.tokenize(q, keep_stopwords=True)
+        for doc_id in sorted(hits.keys()):
+            starts = hits[doc_id][:1]  # first hit per doc
+            out_hits: list[dict] = []
+            for st in starts:
+                page = _page_of_pos(doc_id, st)
+                htab = _table_snippet(doc_id, page, terms)
+                if htab:
+                    out_hits.append(htab)
+                else:
+                    out_hits.append(_paragraph_snippet(doc_id, st, terms))
+            results.append({"doc_id": doc_id, "hits": out_hits})
+
+    elif mode == "boolean":
+        docs = s.search_boolean(q)
+        terms = _ANALYZER.tokenize(q, keep_stopwords=False)
+        for doc_id in docs:
+            pos = _representative_pos(doc_id, terms)
+            page = _page_of_pos(doc_id, pos or 0)
+            htab = _table_snippet(doc_id, page, terms)
+            hit = htab or _paragraph_snippet(doc_id, pos, terms)
+            results.append({"doc_id": doc_id, "hits": [hit]})
+
+    else:  # ranked
+        top = s.search_ranked(q, k=20)
+        terms = _ANALYZER.tokenize(q, keep_stopwords=False)
+        for doc_id, score in top:
+            pos = _representative_pos(doc_id, terms)
+            page = _page_of_pos(doc_id, pos or 0)
+            htab = _table_snippet(doc_id, page, terms)
+            hit = htab or _paragraph_snippet(doc_id, pos, terms)
+            results.append({"doc_id": doc_id, "score": float(score), "hits": [hit]})
+
+    return SearchOut(results=results)
+
+
+# Page image with highlight 
+@app.get("/page-image")
+def page_image(doc_id: str, page: int, q: str):
+    """
+    Render the original PDF page with yellow rectangles over matches.
+    """
+    pth = _DOC_PATHS.get(doc_id)
+    if not pth or not pth.lower().endswith(".pdf"):
+        raise HTTPException(400, "PDF not available for this document.")
+
+    try:
+        doc = fitz.open(pth)
+    except Exception as e:  # pragma: no cover - environment dependent
+        raise HTTPException(500, f"Open PDF failed: {e}") from e
+
+    if not (1 <= page <= len(doc)):
+        raise HTTPException(400, "Invalid page number.")
+
+    pg = doc[page - 1]
+    # collect rectangles for each term
+    rects = []
+    for term in [t for t in q.split() if t.strip()]:
+        try:
+            rects += pg.search_for(term)
+        except Exception:
+            continue
+
+    # render
+    zoom = 2.0
+    mat = fitz.Matrix(zoom, zoom)
+    pm = pg.get_pixmap(matrix=mat, alpha=False)
+    img = Image.frombytes("RGB", [pm.width, pm.height], pm.samples)
+
+    if rects:
+        dr = ImageDraw.Draw(img)
+        for r in rects:
+            x0, y0 = r.x0 * zoom, r.y0 * zoom
+            x1, y1 = r.x1 * zoom, r.y1 * zoom
+            dr.rectangle((x0, y0, x1, y1), outline="yellow", width=3)
+
+    bio = io.BytesIO()
+    img.save(bio, format="PNG")
+    bio.seek(0)
+    return StreamingResponse(bio, media_type="image/png")
