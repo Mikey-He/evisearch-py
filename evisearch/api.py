@@ -3,24 +3,22 @@ from __future__ import annotations
 import html
 import io
 import os
+from pathlib import Path
 import re
 import threading
-from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
-import fitz  # PyMuPDF
-import pdfplumber
-from PIL import Image, ImageDraw
 from fastapi import Body, Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+import fitz  # PyMuPDF  # type: ignore[import-untyped]
+import pdfplumber
+from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 
 from .analyzer import Analyzer
 from .indexer import IndexWriter, InvertedIndex
 from .searcher import PhraseMatcher, Searcher
-
-
 
 # App & global state
 
@@ -40,7 +38,7 @@ _DOC_PATHS: dict[str, str] = {}
 
 # windows for snippets
 LINES_WINDOW = 1  # text: show hit line ±N lines
-COL_WINDOW = 1    # table: show hit col ±N columns
+COL_WINDOW = 1  # table: show hit col ±N columns
 
 # Optional Basic Auth (via env BASIC_USER/BASIC_PASS)
 
@@ -60,7 +58,9 @@ def _check_auth(credentials: HTTPBasicCredentials = Depends(security)) -> None: 
     if not ok:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+
 # Models
+
 
 class DocIn(BaseModel):
     id: str
@@ -79,7 +79,8 @@ class IndexOut(BaseModel):
 
 
 class SearchOut(BaseModel):
-    results: list[dict]
+    results: list[dict[str, Any]]
+
 
 # Helpers
 def _safe_doc_id(name: str) -> str:
@@ -156,7 +157,7 @@ def _highlight_terms(text: str, terms: list[str]) -> str:
     return rx.sub(lambda m: f"<mark>{html.escape(m.group(0))}</mark>", html.escape(text))
 
 
-def _paragraph_snippet(doc_id: str, start_pos: int | None, terms: list[str]) -> dict:
+def _paragraph_snippet(doc_id: str, start_pos: int | None, terms: list[str]) -> dict[str, Any]:
     """
     Build a line-window snippet around the hit line: [hit-LINES_WINDOW, hit+LINES_WINDOW].
     """
@@ -200,8 +201,9 @@ def _guess_header_row(tbl: list[list[str]]) -> int | None:
         return letters / max(1, len(txt))
 
     first = tbl[0]
-    if any((c and any(ch.isalpha() for ch in c)) for c in first) and \
-       not all(_is_numericish(c) for c in first):
+    if any((c and any(ch.isalpha() for ch in c)) for c in first) and not all(
+        _is_numericish(c) for c in first
+    ):
         return 0
 
     scores = []
@@ -221,7 +223,7 @@ def _table_snippet(
     terms: list[str],
     cwin: int = COL_WINDOW,
     rwin: int = 1,
-) -> dict[str, object] | None:
+) -> dict[str, Any] | None:
     """
     Return a dict for a table window if found:
       {
@@ -252,7 +254,7 @@ def _table_snippet(
                 tables = page.find_tables()
 
             terms_l = [t.lower() for t in terms if t]
-            best: tuple[int, object] | None = None
+            best: tuple[int, Any] | None = None
             for tb in tables:
                 grid = tb.extract()
                 flat = " ".join((c or "") for row in grid for c in row)
@@ -304,8 +306,9 @@ def _table_snippet(
                 row = grid[rr]
                 if len(row) <= c1:
                     row = row + [""] * (c1 - len(row) + 1)
-                cells = [ _highlight_terms((row[cc] or "").strip(), terms) 
-                         for cc in range(c0, c1 + 1) ]
+                cells = [
+                    _highlight_terms((row[cc] or "").strip(), terms) for cc in range(c0, c1 + 1)
+                ]
                 sub_rows.append(cells)
 
             def tr(cells: list[str], th: bool = False) -> str:
@@ -321,16 +324,12 @@ def _table_snippet(
             x0, y0, x1, y1 = tb.bbox  # type: ignore[attr-defined]
             return {
                 "kind": "table",
-                "table_html": (
-                    "<table class='snippet-table'>" + "".join(html_rows) + "</table>"
-                ),
+                "table_html": ("<table class='snippet-table'>" + "".join(html_rows) + "</table>"),
                 "bbox": [float(x0), float(y0), float(x1), float(y1)],
                 "page": page_no + 1,
             }
     except Exception:
         return None
-
-    return None
 
 
 def _auto_mode(q: str) -> str:
@@ -343,10 +342,12 @@ def _auto_mode(q: str) -> str:
         return "boolean"
     return "ranked"
 
+
 # Routes
 
+
 @app.get("/", response_class=JSONResponse)
-def root_status():
+def root_status() -> dict[str, Any]:
     return {
         "app": "EviSearch-Py",
         "docs": len(_INDEX.doc_ids) if _INDEX else 0,
@@ -356,7 +357,7 @@ def root_status():
 
 
 @app.get("/ui", response_class=HTMLResponse)
-def ui_page():
+def ui_page() -> HTMLResponse:
     # Minimal UI: dropzone + per-file progress + one search box + simple cards.
     return HTMLResponse(
         """
@@ -562,7 +563,9 @@ refreshState();
         """
     )
 
+
 # Indexing
+
 
 @app.post("/index", response_model=IndexOut)
 def index_docs(
@@ -627,10 +630,7 @@ async def index_files(
             doc_id = os.path.splitext(name)[0]  # nicer id: drop extension
             w.add(doc_id, text, page_map=page_map)
         _INDEX = w.commit()
-        _DOC_PATHS = {
-            os.path.splitext(name)[0]: str(p)
-            for name, p, _t, _pm in saved
-        }
+        _DOC_PATHS = {os.path.splitext(name)[0]: str(p) for name, p, _t, _pm in saved}
 
     return IndexOut(
         ok=True,
@@ -638,7 +638,9 @@ async def index_files(
         vocab=_INDEX.vocabulary_size(),
     )
 
-#Seaching
+
+# Seaching
+
 
 @app.get("/search", response_model=SearchOut)
 def search(
@@ -650,7 +652,7 @@ def search(
 
     mode = _auto_mode(q)
     s = Searcher(_INDEX, _ANALYZER)
-    results: list[dict] = []
+    results: list[dict[str, Any]] = []
 
     if mode == "phrase":
         pm = PhraseMatcher(_INDEX, _ANALYZER)
@@ -658,7 +660,7 @@ def search(
         terms = _ANALYZER.tokenize(q, keep_stopwords=True)
         for doc_id in sorted(hits.keys()):
             starts = hits[doc_id][:1]  # one hit per doc for brevity
-            out_hits: list[dict] = []
+            out_hits: list[dict[str, Any]] = []
             for st in starts:
                 page = _page_of_pos(doc_id, st) or 1
                 table = _table_snippet(doc_id, page - 1, terms)
@@ -680,7 +682,7 @@ def search(
             pos = _representative_pos(doc_id, terms)
             page = _page_of_pos(doc_id, pos or 0) or 1
             table = _table_snippet(doc_id, page - 1, terms)
-            hit = table or _paragraph_snippet(doc_id, pos, terms)
+            hit: dict[str, Any] = table or _paragraph_snippet(doc_id, pos, terms)
             if table:
                 hit["snapshot_url"] = (
                     f"/page-snapshot?doc_id={doc_id}&page={table['page']}"
@@ -696,18 +698,20 @@ def search(
             pos = _representative_pos(doc_id, terms)
             page = _page_of_pos(doc_id, pos or 0) or 1
             table = _table_snippet(doc_id, page - 1, terms)
-            hit = table or _paragraph_snippet(doc_id, pos, terms)
+            hit_data: dict[str, Any] = table or _paragraph_snippet(doc_id, pos, terms)
             if table:
-                hit["snapshot_url"] = (
+                hit_data["snapshot_url"] = (
                     f"/page-snapshot?doc_id={doc_id}&page={table['page']}"
                     f"&x0={table['bbox'][0]}&y0={table['bbox'][1]}"
                     f"&x1={table['bbox'][2]}&y1={table['bbox'][3]}"
                 )
-            results.append({"doc_id": doc_id, "score": float(score), "hits": [hit]})
+            results.append({"doc_id": doc_id, "score": float(score), "hits": [hit_data]})
 
     return SearchOut(results=results)
 
+
 # Page snapshot with highlight box (for tables)
+
 
 @app.get("/page-snapshot")
 def page_snapshot(
@@ -717,7 +721,7 @@ def page_snapshot(
     y0: float = Query(...),
     x1: float = Query(...),
     y1: float = Query(...),
-):
+) -> StreamingResponse:
     """
     Render the PDF page and draw a rectangle for the given bbox.
     Coordinates are PDF points (same as pdfplumber's).
@@ -734,7 +738,7 @@ def page_snapshot(
         pg = doc[pno]
 
         pix = pg.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x for readability
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
         # map PDF coords -> pixels
         rx, ry = pg.rect.width, pg.rect.height
