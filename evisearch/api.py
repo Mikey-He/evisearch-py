@@ -1,910 +1,837 @@
 #ruff: noqa: E501
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass, field
-
-# stdlib
 import html
 import io
-import math
-import os
 from pathlib import Path
 import re
 import threading
-from typing import Annotated, Any
+from typing import Annotated
 
-# third-party
-from fastapi import Body, Depends, FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+import fitz  # PyMuPDF
 import pdfplumber
-from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 
-# optional third-party
-try:
-    import fitz  # type: ignore[import-untyped]  # PyMuPDF
-except Exception:  # pragma: no cover
-    fitz = None  # type: ignore
-
-
-# -----------------------------------------------------------------------------
-# Simple text analyzer / indexer / searcher (self-contained)
-# -----------------------------------------------------------------------------
-class Analyzer:
-    _rx = re.compile(r"\w+", re.UNICODE)
-
-    def iter_tokens(self, text: str) -> Iterable[str]:
-        for m in self._rx.finditer(text.lower()):
-            yield m.group(0)
-
-
-@dataclass
-class InvertedIndex:
-    postings: dict[str, dict[str, list[int]]] = field(default_factory=dict)
-    doc_ids: list[str] = field(default_factory=list)
-    doc_lengths: dict[str, int] = field(default_factory=dict)
-    page_map: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
-    doc_lines: dict[str, list[str]] = field(default_factory=dict)
-    line_of_pos: dict[str, list[int]] = field(default_factory=dict)
-
-    def vocabulary_size(self) -> int:
-        return len(self.postings)
-
-    def get_posting(self, term: str) -> dict[str, list[int]]:
-        return self.postings.get(term, {})
-
-    def df(self, term: str) -> int:
-        return len(self.postings.get(term, {}))
-
-
-class IndexWriter:
-    def __init__(self, analyzer: Analyzer) -> None:
-        self.analyzer = analyzer
-        self.idx = InvertedIndex()
-
-    def add(
-        self,
-        doc_id: str,
-        text: str,
-        page_map: list[tuple[int, int]] | None = None,
-    ) -> None:
-        tokens = list(self.analyzer.iter_tokens(text))
-        self.idx.doc_ids.append(doc_id)
-        self.idx.doc_lengths[doc_id] = len(tokens)
-        self.idx.page_map[doc_id] = list(page_map or [])
-
-        # Build line mapping
-        lines = text.splitlines()
-        self.idx.doc_lines[doc_id] = lines
-        line_of_pos: list[int] = []
-        pos = 0
-        for ln, line in enumerate(lines):
-            for _tok in self.analyzer.iter_tokens(line):
-                line_of_pos.append(ln)
-                pos += 1
-        # If the count mismatches, fall back to proportional fill
-        if len(line_of_pos) != len(tokens):
-            total = max(1, len(tokens))
-            last_line = max(0, len(lines) - 1)
-            line_of_pos = [min(last_line, int(i * len(lines) / total)) for i in range(len(tokens))]
-        self.idx.line_of_pos[doc_id] = line_of_pos
-
-        # Postings with positions
-        ppos = 0
-        for t in tokens:
-            self.idx.postings.setdefault(t, {}).setdefault(doc_id, []).append(ppos)
-            ppos += 1
-
-    def commit(self) -> InvertedIndex:
-        return self.idx
-
-
-class Searcher:
-    def __init__(self, index: InvertedIndex, analyzer: Analyzer) -> None:
-        self.index = index
-        self.analyzer = analyzer
-
-    def _idf(self, term: str) -> float:
-        df = self.index.df(term)
-        n = max(1, len(self.index.doc_ids))
-        return math.log((n + 1) / (df + 1)) + 1.0
-
-    def ranked(self, q: str) -> list[tuple[str, float]]:
-        terms = list(self.analyzer.iter_tokens(q))
-        scores: dict[str, float] = {}
-        for t in terms:
-            posting = self.index.get_posting(t)
-            idf = self._idf(t)
-            for did, plist in posting.items():
-                tf = len(plist)
-                scores[did] = scores.get(did, 0.0) + (tf * idf)
-        return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-
-    def boolean(self, q: str) -> list[str]:
-        # VERY small boolean: terms + AND/OR/NOT with parentheses
-        terms = set(self.analyzer.iter_tokens(q))
-        if not terms:
-            return []
-
-        def term_docs(t: str) -> set[str]:
-            return set(self.index.get_posting(t).keys())
-
-        def prec(op: str) -> int:
-            return {"NOT": 3, "AND": 2, "OR": 1}.get(op, 0)
-
-        tokens: list[str] = []
-        for m in re.finditer(r"\(|\)|AND|OR|NOT|\w+", q, re.I):
-            tokens.append(m.group(0).upper())
-
-        output: list[str] = []
-        ops: list[str] = []
-        for tok in tokens:
-            if tok == "(":
-                ops.append(tok)
-            elif tok == ")":
-                while ops and ops[-1] != "(":
-                    output.append(ops.pop())
-                if ops and ops[-1] == "(":
-                    ops.pop()
-            elif tok in {"AND", "OR", "NOT"}:
-                while ops and ops[-1] != "(" and prec(ops[-1]) >= prec(tok):
-                    output.append(ops.pop())
-                ops.append(tok)
-            else:
-                output.append(tok)
-        while ops:
-            output.append(ops.pop())
-
-        stack: list[set[str]] = []
-        for tok in output:
-            if tok in {"AND", "OR", "NOT"}:
-                if tok == "NOT":
-                    a = stack.pop() if stack else set()
-                    all_docs = set(self.index.doc_ids)
-                    stack.append(all_docs - a)
-                else:
-                    b = stack.pop() if stack else set()
-                    a = stack.pop() if stack else set()
-                    stack.append((a & b) if tok == "AND" else (a | b))
-            else:
-                stack.append(term_docs(tok.lower()))
-        return sorted(stack[-1] if stack else set())
-
-    def phrase_starts(self, q: str, doc_id: str) -> list[int]:
-        words = list(self.analyzer.iter_tokens(q))
-        if not words:
-            return []
-        first = words[0]
-        starts: list[int] = []
-        posting = self.index.get_posting(first).get(doc_id, [])
-        for s in posting:
-            ok = True
-            for i, w in enumerate(words):
-                plist = self.index.get_posting(w).get(doc_id, [])
-                if (s + i) not in plist:
-                    ok = False
-                    break
-            if ok:
-                starts.append(s)
-        return starts
-
-
-# -----------------------------------------------------------------------------
-# FastAPI app and state
-# -----------------------------------------------------------------------------
-app = FastAPI(title="EviSearch-Py", version="2.0.2")
+# App & global state
+app = FastAPI(title="EviSearch-Py", version="1.4.1")
 
 DATA_DIR = Path("data")
 UPLOAD_DIR = DATA_DIR / "uploads"
 DATA_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-_ANALYZER = Analyzer()
 _INDEX_LOCK = threading.Lock()
-_INDEX: InvertedIndex | None = None
 
-# Cache for PDF path (for snapshot) and raw texts for rebuilds
+
+# =========================
+# Indexing primitives
+# =========================
+
+class Analyzer:
+    """Lightweight text analyzer used for tokenization and line splitting."""
+
+    _word = re.compile(r"[A-Za-z0-9_]+")
+
+    def tokenize(self, text: str) -> list[str]:
+        return [m.group(0).lower() for m in self._word.finditer(text or "")]
+
+    def split_lines(self, text: str) -> list[str]:
+        return (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+class InvertedIndex:
+    """
+    Minimal line-level inverted index.
+
+    - texts[doc_id]: full text
+    - lines[doc_id]: list of original lines
+    - page_lines[doc_id]: list[(start_line, page_no)] for PDFs
+    - line_postings[token][doc_id] -> list[line_numbers]
+    """
+
+    def __init__(self) -> None:
+        self.texts: dict[str, str] = {}
+        self.lines: dict[str, list[str]] = {}
+        self.page_lines: dict[str, list[tuple[int, int]]] = {}
+        self.line_postings: dict[str, dict[str, list[int]]] = {}
+
+    # ---- basic ops
+
+    def add_doc(
+        self,
+        doc_id: str,
+        text: str,
+        page_to_lines: list[int] | None = None,
+    ) -> None:
+        self.texts[doc_id] = text
+        lines = ANALYZER.split_lines(text)
+        self.lines[doc_id] = lines
+
+        # Build page -> starting line mapping for PDFs.
+        page_map: list[tuple[int, int]] = []
+        if page_to_lines:
+            start = 0
+            for i, nlines in enumerate(page_to_lines, start=1):
+                page_map.append((start, i))
+                start += nlines
+        self.page_lines[doc_id] = page_map
+
+        # Build line postings.
+        for ln, line in enumerate(lines):
+            for tok in set(ANALYZER.tokenize(line)):
+                self.line_postings.setdefault(tok, {}).setdefault(doc_id, []).append(ln)
+
+    def remove_doc(self, doc_id: str) -> None:
+        if doc_id not in self.texts:
+            return
+
+        # Clean postings.
+        lines = self.lines.get(doc_id, [])
+        for ln, line in enumerate(lines):
+            for tok in set(ANALYZER.tokenize(line)):
+                d = self.line_postings.get(tok)
+                if not d:
+                    continue
+                lst = d.get(doc_id, [])
+                try:
+                    lst.remove(ln)
+                except ValueError:
+                    pass
+                if not lst:
+                    d.pop(doc_id, None)
+                if not d:
+                    self.line_postings.pop(tok, None)
+
+        # Clean maps.
+        self.texts.pop(doc_id, None)
+        self.lines.pop(doc_id, None)
+        self.page_lines.pop(doc_id, None)
+
+    def clear(self) -> None:
+        self.texts.clear()
+        self.lines.clear()
+        self.page_lines.clear()
+        self.line_postings.clear()
+
+    def docs(self) -> int:
+        return len(self.texts)
+
+    # ---- search
+
+    def search_lines_any(
+        self,
+        q: str,
+        doc_id_filter: str | None = None,
+    ) -> dict[str, list[int]]:
+        """Return doc_id -> line numbers where any term appears."""
+        terms = [t for t in ANALYZER.tokenize(q) if t]
+        if not terms:
+            return {}
+        hits: dict[str, list[int]] = {}
+        for t in terms:
+            pd = self.line_postings.get(t, {})
+            for did, lns in pd.items():
+                if doc_id_filter and did != doc_id_filter:
+                    continue
+                hits.setdefault(did, [])
+                hits[did].extend(lns)
+        for did in list(hits.keys()):
+            hits[did] = sorted(set(hits[did]))
+        return hits
+
+    def search_lines_all(
+        self,
+        q: str,
+        doc_id_filter: str | None = None,
+    ) -> dict[str, list[int]]:
+        """Return doc_id -> line numbers where all terms appear."""
+        terms = [t for t in ANALYZER.tokenize(q) if t]
+        if not terms:
+            return {}
+        base = self.line_postings.get(terms[0], {})
+        res: dict[str, list[int]] = {}
+        for did, lns in base.items():
+            if doc_id_filter and did != doc_id_filter:
+                continue
+            inter = set(lns)
+            ok = True
+            for t in terms[1:]:
+                nxt = set(self.line_postings.get(t, {}).get(did, []))
+                inter &= nxt
+                if not inter:
+                    ok = False
+                    break
+            if ok and inter:
+                res[did] = sorted(inter)
+        return res
+
+    def which_page(self, doc_id: str, line_no: int) -> int | None:
+        """Map a 0-based line number to 1-based page number for PDFs (best effort)."""
+        pairs = self.page_lines.get(doc_id) or []
+        page = 1
+        for start_ln, p in pairs:
+            if line_no >= start_ln:
+                page = p
+            else:
+                break
+        return page if pairs else None
+
+
+ANALYZER = Analyzer()
+INDEX = InvertedIndex()
+# doc_id (original filename with extension) -> file path on disk
 _DOC_PATHS: dict[str, str] = {}
-_DOC_TEXTS: dict[str, tuple[str, list[tuple[int, int]]]] = {}
-
-# windows for snippets
-LINES_WINDOW = 1  # text: show hit line ±N lines
-COL_WINDOW = 1  # table: show hit col ±N columns
-
-# Maximum hits to return
-MAX_HITS_DEFAULT = 3  # Default number of hits to show
-MAX_HITS_ALL = 50  # Maximum when showing all
-
-# Optional Basic Auth
-basic_user = os.getenv("BASIC_USER") or ""
-basic_pass = os.getenv("BASIC_PASS") or ""
-security = HTTPBasic()
 
 
-def _needs_auth() -> bool:
-    return bool(basic_user or basic_pass)
+# =========================
+# Pydantic models
+# =========================
+
+class HitText(BaseModel):
+    kind: str = Field(default="text", const=True)
+    page: int | None = None
+    line: int | None = None
+    snippet_html: str
+    snapshot_url: str | None = None
 
 
-def _check_auth(creds: HTTPBasicCredentials = Depends(security)) -> None:  # noqa: B008
-    if not _needs_auth():
-        return
-    ok = creds and creds.username == basic_user and creds.password == basic_pass
-    if not ok:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+class SearchDocResult(BaseModel):
+    doc_id: str
+    hits: list[HitText]
+    total_hits: int
+    has_more: bool | None = None
 
 
-# -----------------------------------------------------------------------------
-# Models
-# -----------------------------------------------------------------------------
-class DocIn(BaseModel):
-    id: str
-    text: str
-    page_map: list[tuple[int, int]] = Field(default_factory=list)
-
-
-class IndexIn(BaseModel):
-    docs: list[DocIn]
+class SearchOut(BaseModel):
+    ok: bool
+    q: str
+    results: list[SearchDocResult]
 
 
 class IndexOut(BaseModel):
     ok: bool
     indexed: int
-    vocab: int
-
-
-class SearchOut(BaseModel):
-    results: list[dict[str, Any]]
 
 
 class DeleteOut(BaseModel):
     ok: bool
-    remaining: int
+    deleted: int
 
 
-class StatusOut(BaseModel):
-    app: str
-    docs: int
-    vocab: int
-    auth: str
-
-
-class SearchIn(BaseModel):
-    q: str = Field(min_length=1)
-    max_hits_per_doc: int = Field(default=3, ge=1, le=MAX_HITS_ALL)
-    context_lines: int = Field(default=1, ge=0, le=8)
-    doc_id: str | None = None
-
-
-# -----------------------------------------------------------------------------
+# =========================
 # Helpers
-# -----------------------------------------------------------------------------
-def _extract_pdf_text_and_page_map(path: Path) -> tuple[str, list[tuple[int, int]]]:
-    texts: list[str] = []
-    page_map: list[tuple[int, int]] = []
-    pos = 0
-    with pdfplumber.open(str(path)) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            txt = page.extract_text() or ""
-            texts.append(txt)
-            toks = list(_ANALYZER.iter_tokens(txt))
-            page_map.append((pos, i))
-            pos += len(toks)
-    joined = "\n\n".join(texts)
-    return joined, page_map
+# =========================
+
+def sanitize_filename(name: str) -> str:
+    """Make a filesystem-safe filename while keeping the extension."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())
+    return safe or "file"
 
 
-def _page_of_pos(doc_id: str, pos: int) -> int | None:
-    if _INDEX is None:
-        return None
-    pm = _INDEX.page_map.get(doc_id)
-    if not pm:
-        return None
-    page: int | None = None
-    for start_pos, pg in pm:
-        if start_pos <= pos:
-            page = pg
-        else:
-            break
-    return page
+def highlight_html(text: str, terms: list[str]) -> str:
+    """Wrap matched terms with <mark> tags in an HTML-safe string."""
 
+    def repl(m: re.Match[str]) -> str:
+        return f"<mark>{html.escape(m.group(0))}</mark>"
 
-def _representative_pos(doc_id: str, terms: list[str]) -> int | None:
-    if _INDEX is None:
-        return None
-    best: int | None = None
-    for t in terms:
-        posting = _INDEX.get_posting(t)
-        plist = posting.get(doc_id, [])
-        if plist:
-            cand = plist[0]
-            if best is None or cand < best:
-                best = cand
-    return best
-
-
-def _all_term_positions(doc_id: str, terms: list[str]) -> list[int]:
-    if _INDEX is None:
-        return []
-    seen: set[int] = set()
-    out: list[int] = []
-    for t in terms:
-        posting = _INDEX.get_posting(t)
-        for p in posting.get(doc_id, []):
-            if p not in seen:
-                seen.add(p)
-                out.append(p)
-    out.sort()
+    out = text
+    for t in sorted(set(terms), key=len, reverse=True):
+        if not t:
+            continue
+        try:
+            out = re.sub(rf"(?i)\b{re.escape(t)}\b", repl, out)
+        except re.error:
+            out = re.sub(re.escape(t), repl, out)
     return out
 
 
-def _highlight_terms(text: str, terms: list[str]) -> str:
-    if not terms:
-        return html.escape(text)
-    pats = sorted({t for t in terms if t}, key=len, reverse=True)
-    rx = re.compile(r"\b(" + "|".join(re.escape(t) for t in pats) + r")\b", re.IGNORECASE)
-    return rx.sub(lambda m: f"<mark>{html.escape(m.group(0))}</mark>", html.escape(text))
-
-
-def _paragraph_snippet(
+def make_text_snippet(
     doc_id: str,
-    start_pos: int | None,
+    line_no: int,
+    context_lines: int,
     terms: list[str],
-    lwin: int = LINES_WINDOW,
-) -> dict[str, Any]:
-    if _INDEX is None or start_pos is None:
-        return {"kind": "text", "snippet_html": "", "line": 0, "page": None}
+) -> HitText:
+    lines = INDEX.lines.get(doc_id, [])
+    lo = max(0, line_no - context_lines)
+    hi = min(len(lines), line_no + context_lines + 1)
+    block = lines[lo:hi]
+    snippet = "\n".join(block)
 
-    lines = _INDEX.doc_lines.get(doc_id, [])
-    line_of_pos = _INDEX.line_of_pos.get(doc_id, [])
-    if not lines or not line_of_pos or start_pos >= len(line_of_pos):
-        return {"kind": "text", "snippet_html": "", "line": 0, "page": None}
+    html_block = html.escape(snippet).replace("\n", "<br/>")
+    html_block = highlight_html(html_block, terms)
 
-    hit = line_of_pos[start_pos]
-    s = max(0, hit - lwin)
-    e = min(len(lines) - 1, hit + lwin)
-    block = "\n".join(lines[s : e + 1])
+    page = INDEX.which_page(doc_id, line_no)
+    snapshot: str | None = None
+    if page is not None and _DOC_PATHS.get(doc_id, "").lower().endswith(".pdf"):
+        snapshot = f"/page-snapshot?doc_id={html.escape(doc_id)}&page={page}"
 
-    page = _page_of_pos(doc_id, start_pos)
-    html_block = "<pre class='snippet'>" + _highlight_terms(block, terms) + "</pre>"
-    return {"kind": "text", "snippet_html": html_block, "line": hit + 1, "page": page}
-
-
-def _is_numericish(s: str) -> bool:
-    s = (s or "").strip()
-    if not s:
-        return False
-    return bool(re.search(r"\d", s))
-
-
-def _table_snippet(
-    doc_id: str,
-    page_no: int,
-    terms: list[str],
-    cwin: int = COL_WINDOW,
-    rwin: int = 1,
-) -> dict[str, Any] | None:
-    pdf_path = _DOC_PATHS.get(doc_id)
-    if not pdf_path or not os.path.exists(pdf_path):
-        return None
-    with pdfplumber.open(pdf_path) as pdf:
-        if page_no < 0 or page_no >= len(pdf.pages):
-            return None
-        page = pdf.pages[page_no]
-        tables = page.find_tables(
-            table_settings={
-                "vertical_strategy": "lines",
-                "horizontal_strategy": "lines",
-                "intersection_tolerance": 5,
-            }
-        )
-        if not tables:
-            tables = page.find_tables()
-
-        terms_l = [t.lower() for t in terms if t]
-        best: tuple[int, Any] | None = None
-        for tb in tables:
-            grid = tb.extract()
-            flat = " ".join((c or "") for row in grid for c in row)
-            hits = sum(
-                1 for t in terms_l if re.search(rf"\b{re.escape(t)}\b", flat, re.IGNORECASE)
-            )
-            if hits > 0 and (best is None or hits > best[0]):
-                best = (hits, tb)
-        if best is None:
-            return None
-        tb = best[1]
-        grid = tb.extract()
-
-        # locate a hit cell
-        hit_rc: list[tuple[int, int]] = []
-        for ri, row in enumerate(grid):
-            for ci, cell in enumerate(row):
-                val = (cell or "").lower()
-                if any(re.search(rf"\b{re.escape(t)}\b", val, re.IGNORECASE) for t in terms_l):
-                    hit_rc.append((ri, ci))
-        if not hit_rc:
-            return None
-
-        max_rows = len(grid)
-        max_cols = len(grid[0]) if grid and grid[0] else 0
-        r0 = min(r for r, _ in hit_rc)
-        r1 = max(r for r, _ in hit_rc)
-        c0 = min(c for _, c in hit_rc)
-        c1 = max(c for _, c in hit_rc)
-        r0 = max(0, r0 - rwin)
-        r1 = min(max_rows - 1, r1 + rwin)
-        c0 = max(0, c0 - cwin)
-        c1 = min((max_cols - 1) if max_cols else 0, c1 + cwin)
-
-        header_row_idx = 0
-        first_row_empty = grid and not any((grid[0][ci] or "").strip() for ci in range(len(grid[0])))
-        if first_row_empty:
-            for rr in range(r0 - 1, -1, -1):
-                row_not_empty = any((grid[rr][ci] or "").strip() for ci in range(len(grid[rr])))
-                if row_not_empty:
-                    header_row_idx = rr
-                    break
-
-        def tr(row: list[str], th: bool = False) -> str:
-            tag = "th" if th else "td"
-            cells: list[str] = []
-            for c in row:
-                v = (c or "").strip()
-                if _is_numericish(v):
-                    cells.append(f"<{tag} class='num'>{html.escape(v)}</{tag}>")
-                else:
-                    cells.append(f"<{tag}>{html.escape(v)}</{tag}>")
-            return "<tr>" + "".join(cells) + "</tr>"
-
-        # Build sub table
-        sub_rows = [grid[i][c0 : c1 + 1] for i in range(r0, r1 + 1)]
-        html_rows: list[str] = []
-        if header_row_idx < len(grid):
-            html_rows.append(tr(grid[header_row_idx], th=True))
-        for r in sub_rows:
-            html_rows.append(tr(r, th=False))
-
-        bbox = getattr(tb, "bbox", None)
-        if not bbox:
-            return None
-        x0, y0, x1, y1 = bbox
-        table_html = "<table class='snippet-table'>" + "".join(html_rows) + "</table>"
-        return {
-            "kind": "table",
-            "table_html": table_html,
-            "bbox": [x0, y0, x1, y1],
-            "page": page_no + 1,
-        }
-
-
-def _auto_mode(q: str) -> str:
-    if '"' in q:
-        return "phrase"
-    if re.search(r"\b(AND|OR|NOT)\b|\(|\)", q, re.IGNORECASE):
-        return "boolean"
-    return "ranked"
-
-
-def _rebuild_index() -> None:
-    global _INDEX
-    with _INDEX_LOCK:
-        writer = IndexWriter(_ANALYZER)
-        for did, (text, page_map) in _DOC_TEXTS.items():
-            writer.add(did, text, page_map=page_map or None)
-        _INDEX = writer.commit()
-
-
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
-@app.get("/", response_model=StatusOut)
-def root_status(_auth: None = Depends(_check_auth)) -> StatusOut:  # noqa: B008
-    return StatusOut(
-        app="EviSearch-Py",
-        docs=len(_INDEX.doc_ids) if _INDEX else 0,
-        vocab=_INDEX.vocabulary_size() if _INDEX else 0,
-        auth="on" if _needs_auth() else "off",
+    return HitText(
+        page=page,
+        line=line_no + 1,
+        snippet_html=html_block,
+        snapshot_url=snapshot,
     )
 
 
-@app.get("/ui", response_class=HTMLResponse)
-def ui_page() -> HTMLResponse:
-    html_doc = (
-        "<!doctype html>\n"
-        "<html>\n"
-        "<head>\n"
-        '  <meta charset="utf-8">\n'
-        '  <meta name="viewport" content="width=device-width,initial-scale=1">\n'
-        "  <title>EviSearch-Py</title>\n"
-        '  <link rel="stylesheet" href="/ui.css">\n'
-        "</head>\n"
-        "<body>\n"
-        '  <header class="top">EviSearch-Py</header>\n'
-        '  <main class="wrap">\n'
-        '    <section class="uploader">\n'
-        '      <div id="drop">Drop or choose files</div>\n'
-        '      <input id="pick" type="file" multiple>\n'
-        '      <button id="clearAll">Clear All</button>\n'
-        '      <div id="list"></div>\n'
-        "    </section>\n"
-        '    <section class="search">\n'
-        '      <input id="q" placeholder="Search terms">\n'
-        '      <label>Max hits/doc <input id="maxhits" type="number" value="3"></label>\n'
-        '      <label>Context lines <input id="ctx" type="number" value="1"></label>\n'
-        '      <button id="go">Search</button>\n'
-        '      <div id="out"></div>\n'
-        "    </section>\n"
-        "  </main>\n"
-        '  <div id="lightbox" class="hide"><img id="big"></div>\n'
-        '  <script src="/ui.js"></script>\n'
-        "</body>\n"
-        "</html>\n"
-    )
-    return HTMLResponse(html_doc)
-
-
-@app.get("/ui.css", response_class=HTMLResponse)
-def ui_css() -> HTMLResponse:
-    css = (
-        ":root{--bg:#0b0f18;--fg:#e7eaf2;--card:#131a27;--accent:#2ea043;}\n"
-        "body{background:var(--bg);color:var(--fg);font-family:system-ui,Arial;}\n"
-        ".wrap{max-width:980px;margin:20px auto;padding:12px;}\n"
-        ".top{font-weight:700;padding:12px 0;text-align:center;}\n"
-        ".uploader,.search{background:var(--card);padding:12px;border-radius:12px;}\n"
-        "#drop{border:1px dashed #345;padding:24px;text-align:center;margin-bottom:8px;}\n"
-        "#list .row{display:flex;gap:8px;align-items:center;margin:6px 0;}\n"
-        "#list .name{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}\n"
-        ".btn{padding:4px 8px;border:1px solid #456;border-radius:8px;background:#182131;}\n"
-        ".hit{border-top:1px solid #234;padding:8px 0;}\n"
-        ".snippet{white-space:pre-wrap;line-height:1.35;}\n"
-        "#lightbox{position:fixed;inset:0;background:rgba(0,0,0,.85);}\n"
-        "#lightbox.hide{display:none;}\n"
-        "#lightbox img{max-width:none;cursor:grab;transform-origin:0 0;}\n"
-        "table.snippet-table{border-collapse:collapse;width:100%;}\n"
-        "table.snippet-table td,table.snippet-table th{border:1px solid #223;padding:4px;}\n"
-        "table.snippet-table th{background:#0f1726;}\n"
-        "td.num{text-align:right;}\n"
-    )
-    return HTMLResponse(css, media_type="text/css")
-
-
-@app.get("/ui.js", response_class=HTMLResponse)
-def ui_js() -> HTMLResponse:
-    js = (
-        "(function(){\n"
-        "const drop = document.getElementById('drop');\n"
-        "const pick = document.getElementById('pick');\n"
-        "const list = document.getElementById('list');\n"
-        "const clearAll = document.getElementById('clearAll');\n"
-        "const q = document.getElementById('q');\n"
-        "const maxhits = document.getElementById('maxhits');\n"
-        "const ctx = document.getElementById('ctx');\n"
-        "const go = document.getElementById('go');\n"
-        "const out = document.getElementById('out');\n"
-        "const lb = document.getElementById('lightbox');\n"
-        "const big = document.getElementById('big');\n"
-        "function row(did){\n"
-        "  const el = document.createElement('div'); el.className='row';\n"
-        "  el.innerHTML = '<span class=\"name\"></span>'+\n"
-        "    '<progress max=\"100\" value=\"0\"></progress>'+\n"
-        "    '<button class=\"btn cancel\">×</button>'+\n"
-        "    '<button class=\"btn del\">Delete</button>';\n"
-        "  el.querySelector('.name').textContent = did; return el;\n"
-        "}\n"
-        "function upload(file){\n"
-        "  const did = file.name; const r = row(did); list.appendChild(r);\n"
-        "  const xhr = new XMLHttpRequest();\n"
-        "  xhr.open('POST','/index-files');\n"
-        "  const fd = new FormData(); fd.append('files', file, file.name);\n"
-        "  xhr.upload.onprogress = e=>{ if(e.lengthComputable){\n"
-        "    r.querySelector('progress').value = Math.round(e.loaded*100/e.total);} };\n"
-        "  r.querySelector('.cancel').onclick = ()=>{ xhr.abort(); r.remove(); };\n"
-        "  r.querySelector('.del').onclick = async ()=>{\n"
-        "    await fetch('/files/'+encodeURIComponent(did),{method:'DELETE'});\n"
-        "    r.remove(); };\n"
-        "  xhr.onload = ()=>{ r.querySelector('progress').value=100; };\n"
-        "  xhr.send(fd);\n"
-        "}\n"
-        "drop.ondragover = e=>{e.preventDefault();};\n"
-        "drop.ondrop = e=>{e.preventDefault(); for(const f of e.dataTransfer.files) upload(f);};\n"
-        "pick.onchange = ()=>{ for(const f of pick.files) upload(f); pick.value=''; };\n"
-        "clearAll.onclick = async ()=>{ await fetch('/files',{method:'DELETE'}); list.innerHTML=''; };\n"
-        "go.onclick = async ()=>{\n"
-        "  const body = { q:q.value, max_hits_per_doc:+maxhits.value, context_lines:+ctx.value };\n"
-        "  const r = await fetch('/search',{\n"
-        "    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});\n"
-        "  const data = await r.json(); render(data.results);\n"
-        "};\n"
-        "function render(results){ out.innerHTML='';\n"
-        "  for(const item of results){\n"
-        "    const card = document.createElement('div'); card.className='card';\n"
-        "    card.innerHTML = '<h4>'+item.doc_id+'</h4>';\n"
-        "    for(const h of (item.hits||[])){\n"
-        "      const wrap = document.createElement('div'); wrap.className='hit';\n"
-        "      if(h.kind==='table' && h.snapshot_url){\n"
-        "        const img = document.createElement('img'); img.src=h.snapshot_url; img.style.maxWidth='320px';\n"
-        "        img.style.border='1px solid #223'; img.style.cursor='zoom-in';\n"
-        "        img.onclick = ()=> openLightbox(img.src); wrap.appendChild(img);\n"
-        "      } else { wrap.innerHTML += '<div class=\"snippet\">'+(h.snippet_html||'')+'</div>'; }\n"
-        "      card.appendChild(wrap);\n"
-        "    } out.appendChild(card);\n"
-        "  }\n"
-        "}\n"
-        "function openLightbox(src){ lb.classList.remove('hide'); big.src = src; big.style.transform='scale(1)';\n"
-        "  big.dataset.scale='1'; big.dataset.x='0'; big.dataset.y='0'; }\n"
-        "lb.onclick = e=>{ if(e.target===lb) lb.classList.add('hide'); };\n"
-        "document.addEventListener('keydown',e=>{ if(e.key==='Escape') lb.classList.add('hide'); });\n"
-        "let drag=false, lastX=0, lastY=0;\n"
-        "big.onmousedown = e=>{ drag=true; lastX=e.clientX; lastY=e.clientY; big.style.cursor='grabbing'; };\n"
-        "document.onmouseup = ()=>{ drag=false; big.style.cursor='grab'; };\n"
-        "document.onmousemove = e=>{ if(!drag) return;\n"
-        "  const dx=e.clientX-lastX, dy=e.clientY-lastY; lastX=e.clientX; lastY=e.clientY;\n"
-        "  const x=+big.dataset.x+dx, y=+big.dataset.y+dy; big.dataset.x=x; big.dataset.y=y; applyTransform(); };\n"
-        "big.onwheel = e=>{ e.preventDefault(); const s=+big.dataset.scale;\n"
-        "  const ns = Math.min(6, Math.max(0.5, s + (e.deltaY<0?0.2:-0.2))); big.dataset.scale = ns.toString(); applyTransform(); };\n"
-        "function applyTransform(){ const s=big.dataset.scale, x=big.dataset.x, y=big.dataset.y;\n"
-        "  big.style.transform = 'translate('+x+'px,'+y+'px) scale('+s+')'; }\n"
-        "})();\n"
-    )
-    return HTMLResponse(js, media_type="application/javascript")
-
-
-@app.post("/index", response_model=IndexOut)
-def index_docs(
-    payload: Annotated[IndexIn, Body(...)],
-    _auth: None = Depends(_check_auth),  # noqa: B008
-) -> IndexOut:
-    global _DOC_TEXTS, _DOC_PATHS
-    _DOC_TEXTS = {d.id: (d.text, d.page_map or []) for d in payload.docs}
-    _DOC_PATHS = {}
-    _rebuild_index()
-    return IndexOut(
-        ok=True,
-        indexed=len(_INDEX.doc_ids) if _INDEX else 0,
-        vocab=_INDEX.vocabulary_size() if _INDEX else 0,
-    )
-
+# =========================
+# Indexing & file mgmt
+# =========================
 
 @app.post("/index-files", response_model=IndexOut)
 async def index_files(
-    files: list[UploadFile] = File(...),  # noqa: B008
-    _auth: None = Depends(_check_auth),  # noqa: B008
+    files: Annotated[list[UploadFile], File(description="Files to index")],
 ) -> IndexOut:
+    """
+    Upload and (re)build the index from provided files.
+    doc_id == original filename (with extension); same-name overwrites.
+    """
     if not files:
-        raise HTTPException(400, "No files")
+        raise HTTPException(400, "No files uploaded.")
 
-    global _DOC_TEXTS, _DOC_PATHS
+    saved: list[tuple[str, Path, str, list[int] | None]] = []
+    for uf in files:
+        raw_name = uf.filename or "file"
+        fname = sanitize_filename(raw_name)
+        path_out = UPLOAD_DIR / fname
+        content = await uf.read()
+        path_out.write_bytes(content)
 
-    for f in files:
-        name = f.filename or "unnamed"
-        doc_id = name  # keep extension
-        suffix = os.path.splitext(name)[1].lower()
-        raw = await f.read()
-        if not raw:
-            continue
-        out_path = UPLOAD_DIR / name
-        out_path.write_bytes(raw)
+        text = ""
+        page_lines: list[int] | None = None
 
-        if suffix == ".pdf":
-            text, page_map = _extract_pdf_text_and_page_map(out_path)
-            _DOC_TEXTS[doc_id] = (text, page_map)
-            _DOC_PATHS[doc_id] = str(out_path)
-        elif suffix in {".txt", ".md", ".csv"}:
-            try:
-                text = raw.decode("utf-8", errors="replace")
-            except Exception:
-                text = raw.decode("latin-1", errors="replace")
-            _DOC_TEXTS[doc_id] = (text, [])
+        if fname.lower().endswith(".pdf"):
+            text_parts: list[str] = []
+            page_lines = []
+            with pdfplumber.open(str(path_out)) as pdf:
+                for page in pdf.pages:
+                    t = page.extract_text() or ""
+                    lines = ANALYZER.split_lines(t)
+                    text_parts.append(t)
+                    page_lines.append(len(lines))
+            text = "\n".join(text_parts)
         else:
-            # unsupported: keep file, but do not index
-            pass
+            try:
+                text = content.decode("utf-8", errors="replace")
+            except Exception:
+                text = ""
 
-    _rebuild_index()
-    return IndexOut(
-        ok=True,
-        indexed=len(_INDEX.doc_ids) if _INDEX else 0,
-        vocab=_INDEX.vocabulary_size() if _INDEX else 0,
-    )
+        saved.append((fname, path_out, text, page_lines))
+
+    # Rebuild index atomically.
+    with _INDEX_LOCK:
+        INDEX.clear()
+        _DOC_PATHS.clear()
+        for name, p, text, page_map in saved:
+            INDEX.add_doc(name, text, page_map)
+            _DOC_PATHS[name] = str(p)
+
+    return IndexOut(ok=True, indexed=INDEX.docs())
 
 
 @app.delete("/files/{doc_id}", response_model=DeleteOut)
-def delete_file(doc_id: str, _auth: None = Depends(_check_auth)) -> DeleteOut:  # noqa: B008
-    global _DOC_TEXTS, _DOC_PATHS
-    if doc_id not in _DOC_TEXTS:
-        raise HTTPException(404, f"doc_id not found: {doc_id}")
-    _DOC_TEXTS.pop(doc_id, None)
-    _DOC_PATHS.pop(doc_id, None)
-    _rebuild_index()
-    remain = len(_INDEX.doc_ids) if _INDEX else 0
-    return DeleteOut(ok=True, remaining=remain)
+def delete_file(doc_id: str) -> DeleteOut:
+    """Delete a single file by doc_id (original filename with extension)."""
+    with _INDEX_LOCK:
+        removed = 0
+        path = _DOC_PATHS.pop(doc_id, None)
+        if path:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                # Ignore filesystem errors but keep index consistent.
+                pass
+            INDEX.remove_doc(doc_id)
+            removed = 1
+    return DeleteOut(ok=True, deleted=removed)
 
 
 @app.delete("/files", response_model=DeleteOut)
-def clear_all(_auth: None = Depends(_check_auth)) -> DeleteOut:  # noqa: B008
-    global _DOC_TEXTS, _DOC_PATHS, _INDEX
-    _DOC_TEXTS.clear()
-    _DOC_PATHS.clear()
-    _INDEX = None
-    return DeleteOut(ok=True, remaining=0)
+def delete_all_files() -> DeleteOut:
+    """Clear all uploaded files and reset the index."""
+    with _INDEX_LOCK:
+        deleted = 0
+        for _, p in list(_DOC_PATHS.items()):
+            try:
+                Path(p).unlink(missing_ok=True)
+                deleted += 1
+            except Exception:
+                pass
+        _DOC_PATHS.clear()
+        INDEX.clear()
+    return DeleteOut(ok=True, deleted=deleted)
 
 
-# -----------------------------------------------------------------------------
-# Searching
-# -----------------------------------------------------------------------------
-@app.get("/search", response_model=SearchOut)
-def search(
-    q: Annotated[str, Query(min_length=1)],
-    all_hits: bool = Query(False, description="Return all hits"),
-    doc_id: str | None = Query(None, description="Filter to doc_id"),
-    _auth: None = Depends(_check_auth),  # noqa: B008
+# =========================
+# Search
+# =========================
+
+def _search_impl(
+    q: str,
+    mode: str,
+    doc_id: str | None,
+    all_hits: bool,
+    max_hits_per_doc: int,
+    context_lines: int,
 ) -> SearchOut:
-    if _INDEX is None:
-        raise HTTPException(400, "Index empty. Upload first on /ui or /index.")
+    if not q.strip():
+        return SearchOut(ok=True, q=q, results=[])
 
-    mode = _auto_mode(q)
-    results: list[dict[str, Any]] = []
-    terms = list(_ANALYZER.iter_tokens(q))
+    terms = [t for t in ANALYZER.tokenize(q) if t]
 
-    # doc iterator helper
-    def each_doc(doc_iterable: Iterable[str]) -> Iterable[str]:
-        for did in doc_iterable:
-            if doc_id and did != doc_id:
-                continue
-            yield did
+    # Collect hits per doc (line numbers).
+    if mode == "boolean":
+        doc_hits = INDEX.search_lines_all(q, doc_id)
+    else:
+        doc_hits = INDEX.search_lines_any(q, doc_id)
 
-    if mode == "phrase":
-        sch = Searcher(_INDEX, _ANALYZER)
-        for did in each_doc(_INDEX.doc_ids):
-            starts = sch.phrase_starts(q, did)
-            if not starts:
-                continue
-            limit = MAX_HITS_ALL if all_hits else MAX_HITS_DEFAULT
-            hits_to_show = starts[:limit]
-            out_hits: list[dict[str, Any]] = []
-            for st in hits_to_show:
-                page = _page_of_pos(did, st) or 1
-                table = _table_snippet(did, page - 1, terms)
-                if table:
-                    bbox = table["bbox"]
-                    table["snapshot_url"] = (
-                        f"/page-snapshot?doc_id={did}&page={table['page']}"
-                        f"&x0={bbox[0]}&y0={bbox[1]}&x1={bbox[2]}&y1={bbox[3]}"
-                    )
-                    out_hits.append(table)
-                else:
-                    out_hits.append(_paragraph_snippet(did, st, terms))
-            obj: dict[str, Any] = {"doc_id": did, "hits": out_hits, "total_hits": len(starts)}
-            if not all_hits and len(starts) > MAX_HITS_DEFAULT:
-                obj["has_more"] = True
-            results.append(obj)
+    results: list[SearchDocResult] = []
 
-    elif mode == "boolean":
-        sch = Searcher(_INDEX, _ANALYZER)
-        docs = sch.boolean(q)
-        for did in each_doc(docs):
-            all_positions = _all_term_positions(did, terms)
-            if not all_positions:
-                continue
-            limit = MAX_HITS_ALL if all_hits else MAX_HITS_DEFAULT
-            positions_to_show = all_positions[:limit]
-            out_hits = []
-            for pos in positions_to_show:
-                page = _page_of_pos(did, pos) or 1
-                table = _table_snippet(did, page - 1, terms)
-                hit = table or _paragraph_snippet(did, pos, terms)
-                if table:
-                    bbox = table["bbox"]
-                    hit["snapshot_url"] = (
-                        f"/page-snapshot?doc_id={did}&page={table['page']}"
-                        f"&x0={bbox[0]}&y0={bbox[1]}&x1={bbox[2]}&y1={bbox[3]}"
-                    )
-                out_hits.append(hit)
-            obj = {"doc_id": did, "hits": out_hits, "total_hits": len(all_positions)}
-            if not all_hits and len(all_positions) > MAX_HITS_DEFAULT:
-                obj["has_more"] = True
-            results.append(obj)
+    for did, lines in doc_hits.items():
+        total = len(lines)
+        limit = total if all_hits else max_hits_per_doc
+        show = lines[:limit]
 
-    else:  # ranked
-        sch = Searcher(_INDEX, _ANALYZER)
-        for did, score in sch.ranked(q)[:20]:
-            if doc_id and did != doc_id:
-                continue
-            all_positions = _all_term_positions(did, terms)
-            if not all_positions:
-                rep = _representative_pos(did, terms)
-                if rep is None:
-                    continue
-                all_positions = [rep]
-            limit = MAX_HITS_ALL if all_hits else MAX_HITS_DEFAULT
-            positions_to_show = all_positions[:limit]
-            out_hits = []
-            for pos in positions_to_show:
-                page = _page_of_pos(did, pos) or 1
-                table = _table_snippet(did, page - 1, terms)
-                hit = table or _paragraph_snippet(did, pos, terms)
-                if table:
-                    bbox = table["bbox"]
-                    hit["snapshot_url"] = (
-                        f"/page-snapshot?doc_id={did}&page={table['page']}"
-                        f"&x0={bbox[0]}&y0={bbox[1]}&x1={bbox[2]}&y1={bbox[3]}"
-                    )
-                out_hits.append(hit)
-            obj = {
-                "doc_id": did,
-                "score": float(score),
-                "hits": out_hits,
-                "total_hits": len(all_positions),
-            }
-            if not all_hits and len(all_positions) > MAX_HITS_DEFAULT:
-                obj["has_more"] = True
-            results.append(obj)
+        hits = [make_text_snippet(did, ln, context_lines, terms) for ln in show]
 
-    return SearchOut(results=results)
+        res = SearchDocResult(doc_id=did, hits=hits, total_hits=total)
+        if not all_hits and total > limit:
+            res.has_more = True
+        results.append(res)
+
+    return SearchOut(ok=True, q=q, results=results)
+
+
+@app.get("/search", response_model=SearchOut)
+def search_get(
+    q: str = Query(..., description="Search query"),
+    mode: str = Query("default", pattern="^(default|boolean)$"),
+    doc_id: str | None = Query(None),
+    all_hits: bool = Query(False),
+) -> SearchOut:
+    """Legacy GET search (kept for compatibility)."""
+    return _search_impl(
+        q=q,
+        mode=mode,
+        doc_id=doc_id,
+        all_hits=all_hits,
+        max_hits_per_doc=3,
+        context_lines=1,
+    )
+
+
+class SearchIn(BaseModel):
+    q: str
+    mode: str = Field(default="default", pattern="^(default|boolean)$")
+    doc_id: str | None = None
+    all_hits: bool = False
+    max_hits_per_doc: int = Field(default=3, ge=1, le=50)
+    context_lines: int = Field(default=1, ge=0, le=10)
 
 
 @app.post("/search", response_model=SearchOut)
-def search_post(
-    body: SearchIn,
-    _auth: None = Depends(_check_auth),  # noqa: B008
-) -> SearchOut:
-    global LINES_WINDOW
-    old = LINES_WINDOW
-    LINES_WINDOW = body.context_lines
-    try:
-        res = search(q=body.q, all_hits=False, doc_id=body.doc_id)
-    finally:
-        LINES_WINDOW = old
-
-    trimmed: list[dict[str, Any]] = []
-    for item in res.results:
-        hits = item.get("hits", [])
-        total = item.get("total_hits", len(hits))
-        limit = max(1, min(body.max_hits_per_doc, MAX_HITS_ALL))
-        new_hits = hits[:limit]
-        obj = dict(item)
-        obj["hits"] = new_hits
-        obj["has_more"] = total > limit
-        trimmed.append(obj)
-    return SearchOut(results=trimmed)
+def search_post(body: Annotated[SearchIn, Body(...)]) -> SearchOut:
+    """POST search with controls for per-doc hit limit and snippet context lines."""
+    return _search_impl(
+        q=body.q,
+        mode=body.mode,
+        doc_id=body.doc_id,
+        all_hits=body.all_hits,
+        max_hits_per_doc=body.max_hits_per_doc,
+        context_lines=body.context_lines,
+    )
 
 
-# -----------------------------------------------------------------------------
-# Page snapshot (PDF)
-# -----------------------------------------------------------------------------
+# =========================
+# Page snapshot (PDF -> PNG)
+# =========================
+
 @app.get("/page-snapshot")
 def page_snapshot(
-    doc_id: str,
+    doc_id: str = Query(...),
     page: int = Query(..., ge=1),
-    x0: float = Query(...),
-    y0: float = Query(...),
-    x1: float = Query(...),
-    y1: float = Query(...),
-    _auth: None = Depends(_check_auth),  # noqa: B008
+    x0: float | None = None,
+    y0: float | None = None,
+    x1: float | None = None,
+    y1: float | None = None,
 ) -> StreamingResponse:
-    if fitz is None:
-        raise HTTPException(500, "PyMuPDF not available")
-    pdf_path = _DOC_PATHS.get(doc_id)
-    if not pdf_path or not os.path.exists(pdf_path):
-        raise HTTPException(404, f"PDF not found for {doc_id}")
-    doc = fitz.open(pdf_path)
+    """
+    Render a PDF page (or a highlighted box if bbox provided) to PNG.
+    If bbox is omitted, the whole page is returned.
+    """
+    path = _DOC_PATHS.get(doc_id)
+    if not path or not path.lower().endswith(".pdf"):
+        raise HTTPException(404, "PDF not found for snapshot.")
+
     try:
-        pg = doc.load_page(page - 1)
+        doc = fitz.open(path)
+        pno = page - 1
+        if pno < 0 or pno >= doc.page_count:
+            raise HTTPException(400, "Invalid page.")
+        pg = doc[pno]
+
+        # Simple render at 2x scale.
         pix = pg.get_pixmap(matrix=fitz.Matrix(2, 2))
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        img_bytes = pix.tobytes("png")
 
-        rx, ry = pg.rect.width, pg.rect.height
-        sx = pix.width / rx
-        sy = pix.height / ry
-        box = (int(x0 * sx), int(y0 * sy), int(x1 * sx), int(y1 * sy))
+        # If a bbox is provided, draw it using Pillow then return.
+        if None not in (x0, y0, x1, y1):
+            from PIL import Image, ImageDraw  # lazy import only if needed
 
-        dr = ImageDraw.Draw(img)
-        dr.rectangle(box, outline=(255, 255, 0), width=3)
+            img = Image.open(io.BytesIO(img_bytes))
+            rx, ry = pg.rect.width, pg.rect.height
+            sx = img.width / rx
+            sy = img.height / ry
+            box = (int(x0 * sx), int(y0 * sy), int(x1 * sx), int(y1 * sy))
+            draw = ImageDraw.Draw(img)
+            draw.rectangle(box, outline=(255, 204, 0), width=4)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            return StreamingResponse(buf, media_type="image/png")
 
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        return StreamingResponse(buf, media_type="image/png")
-    finally:
-        doc.close()
+        return StreamingResponse(io.BytesIO(img_bytes), media_type="image/png")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"render failed: {e}") from e
+
+
+# =========================
+# Status
+# =========================
+
+@app.get("/", response_class=JSONResponse)
+def root_status() -> dict[str, int | str]:
+    return {"app": "EviSearch-Py", "docs": INDEX.docs()}
+
+
+# =========================
+# Inline UI (style preserved)
+# =========================
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui_page() -> HTMLResponse:
+    # Keep the existing dark, rounded, badge + <mark> highlight style.
+    # Only add missing behaviors (cancel upload, lightbox zoom/pan, REST deletes).
+    return HTMLResponse(
+        """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>EviSearch-Py</title>
+<style>
+:root{
+  --bg:#0b0f18; --fg:#e7eaf2; --muted:#9aa3b2; --card:#131a27;
+  --accent:#2ea043; --mark:#fff59d; --line:#2b3a55; --danger:#e94d5f;
+}
+html,body{background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,Segoe UI}
+.wrap{max-width:960px;margin:32px auto;padding:0 16px}
+h1{font-size:28px;margin:0 0 6px}
+.sub{color:var(--muted);margin:0 0 20px}
+.zone{border:2px dashed #30405c;border-radius:14px;padding:18px;background:var(--card);
+  display:flex;gap:12px;align-items:center}
+.zone.drag{outline:2px solid #4b6cb7}
+.btn{background:#1f2937;color:var(--fg);border:1px solid var(--line);border-radius:10px;
+  padding:8px 12px;cursor:pointer}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#08110a}
+.btn.danger{background:transparent;border:none;color:var(--danger);font-size:20px;line-height:1}
+.btn.danger:hover{color:#ff6b7a}
+.row{display:flex;align-items:center;gap:8px}
+.file{display:grid;grid-template-columns:1fr 120px 90px 32px;gap:10px;
+  padding:10px;border:1px solid var(--line);border-radius:10px;background:#0f1625}
+.file-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+progress{width:120px;height:10px}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--line);
+  color:var(--muted);font-size:12px;margin-left:6px}
+.input{flex:1;background:#0e1420;border:1px solid var(--line);color:var(--fg);
+  padding:8px 10px;border-radius:10px}
+.card{background:#0e1420;border:1px solid #20304e;border-radius:14px;padding:12px 14px;margin:12px 0}
+.doc{font-weight:600;margin-bottom:4px}
+meta{color:var(--muted)}
+.hit{margin:12px 0;padding:12px;background:#0d1320;border-radius:10px}
+.hit .meta{color:var(--muted);font-size:14px;margin-bottom:8px}
+mark{background:var(--mark);color:#222}
+img.thumb{max-width:420px;border:1px solid var(--line);border-radius:8px;cursor:zoom-in}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.88);display:none;z-index:1000}
+.modal.active{display:flex;align-items:center;justify-content:center}
+.modal-content{max-width:90vw;max-height:90vh;position:relative;overflow:hidden}
+.modal-img{user-select:none;cursor:grab;transform-origin:center center;touch-action:none}
+.modal-close{position:absolute;top:14px;right:18px;background:transparent;border:none;
+  color:#eee;font-size:28px;cursor:pointer}
+.bar{display:flex;gap:10px;margin:10px 0}
+.muted{color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>EviSearch-Py</h1>
+  <div class="sub">Multiple-file upload, multi-hit search with highlighting</div>
+
+  <div class="zone" id="zone">
+    <button class="btn" id="pickBtn">Pick files</button>
+    <input id="picker" type="file" multiple style="display:none"/>
+    <button class="btn" id="clearAll">Clear All</button>
+    <span id="state" class="badge">docs: --</span>
+  </div>
+
+  <div id="files"></div>
+
+  <div class="bar">
+    <input id="q" class="input" placeholder="Search phrase..."/>
+    <label class="row">
+      <input type="checkbox" id="allHits"/>
+      <span class="muted">Show all hits</span>
+    </label>
+    <button class="btn primary" id="go">Search</button>
+  </div>
+
+  <div id="results"></div>
+</div>
+
+<!-- Lightbox -->
+<div class="modal" id="modal" aria-hidden="true">
+  <div class="modal-content" id="modalContent">
+    <button class="modal-close" id="modalClose" title="Close (Esc)">×</button>
+    <img id="modalImg" class="modal-img" alt="preview"/>
+  </div>
+</div>
+
+<script>
+const zone = document.getElementById('zone');
+const pickBtn = document.getElementById('pickBtn');
+const picker = document.getElementById('picker');
+const filesBox = document.getElementById('files');
+const clearAllBtn = document.getElementById('clearAll');
+const stateEl = document.getElementById('state');
+const q = document.getElementById('q');
+const allHits = document.getElementById('allHits');
+const go = document.getElementById('go');
+const results = document.getElementById('results');
+
+function refreshState() {
+  fetch('/', {cache:'no-store'}).then(r => r.json()).then(j => {
+    stateEl.textContent = `docs: ${j.docs}`;
+  });
+}
+
+function createRow(name) {
+  const row = document.createElement('div');
+  row.className = 'file';
+  row.innerHTML = `
+    <div class="file-name">${name}</div>
+    <progress value="0" max="100"></progress>
+    <span class="muted">waiting</span>
+    <button class="btn danger" title="Cancel / Remove">×</button>
+  `;
+  return row;
+}
+
+function uploadOne(file) {
+  const row = createRow(file.name);
+  filesBox.appendChild(row);
+  const prog = row.querySelector('progress');
+  const status = row.querySelector('.muted');
+  const btn = row.querySelector('.btn.danger');
+
+  const form = new FormData();
+  form.append('files', file);
+
+  const xhr = new XMLHttpRequest();
+  row._xhr = xhr;
+
+  xhr.open('POST', '/index-files', true);
+
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) {
+      prog.value = Math.round(100 * e.loaded / e.total);
+      status.textContent = `uploading ${prog.value}%`;
+    }
+  };
+
+  xhr.onreadystatechange = () => {
+    if (xhr.readyState === 4) {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        status.textContent = 'indexed';
+        prog.value = 100;
+        refreshState();
+      } else if (xhr.status === 0) {
+        status.textContent = 'canceled';
+      } else {
+        status.textContent = 'error';
+      }
+    }
+  };
+
+  btn.onclick = () => {
+    if (row._xhr && row._xhr.readyState !== 4) {
+      row._xhr.abort(); // true cancel
+      status.textContent = 'canceled';
+    } else {
+      // after upload: try to remove from server
+      fetch(`/files/${encodeURIComponent(file.name)}`, {method:'DELETE'})
+        .then(() => {
+          row.remove();
+          refreshState();
+        });
+    }
+  };
+
+  xhr.send(form);
+}
+
+function handleFiles(fileList) {
+  [...fileList].forEach(uploadOne);
+}
+
+zone.addEventListener('dragover', e => {
+  e.preventDefault(); zone.classList.add('drag');
+});
+zone.addEventListener('dragleave', () => zone.classList.remove('drag'));
+zone.addEventListener('drop', e => {
+  e.preventDefault(); zone.classList.remove('drag');
+  const files = e.dataTransfer.files;
+  if (files && files.length) handleFiles(files);
+});
+
+pickBtn.onclick = () => picker.click();
+picker.onchange = () => picker.files && handleFiles(picker.files);
+
+clearAllBtn.onclick = () => {
+  if (!confirm('Clear all files and index?')) return;
+  fetch('/files', {method:'DELETE'}).then(() => {
+    filesBox.innerHTML = '';
+    refreshState();
+  });
+};
+
+function openModal(src) {
+  const modal = document.getElementById('modal');
+  const img = document.getElementById('modalImg');
+  img.src = src;
+  img.style.transform = 'translate(0px,0px) scale(1)';
+  img.dataset.scale = '1';
+  img.dataset.x = '0';
+  img.dataset.y = '0';
+  modal.classList.add('active');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeModal() {
+  const modal = document.getElementById('modal');
+  modal.classList.remove('active');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+document.getElementById('modalClose').onclick = closeModal;
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+});
+
+// Zoom & Pan
+(function(){
+  const img = document.getElementById('modalImg');
+  let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+
+  function apply() {
+    img.style.transform =
+      `translate(${ox}px,${oy}px) scale(${parseFloat(img.dataset.scale||'1')})`;
+  }
+  img.addEventListener('wheel', e => {
+    e.preventDefault();
+    let s = parseFloat(img.dataset.scale || '1');
+    s *= (e.deltaY < 0) ? 1.1 : 0.9;
+    s = Math.min(8, Math.max(0.2, s));
+    img.dataset.scale = String(s);
+    apply();
+  }, {passive:false});
+
+  img.addEventListener('mousedown', e => {
+    dragging = true; img.style.cursor = 'grabbing';
+    sx = e.clientX; sy = e.clientY;
+  });
+  window.addEventListener('mouseup', () => {
+    dragging = false; img.style.cursor = 'grab';
+  });
+  window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    ox += (e.clientX - sx);
+    oy += (e.clientY - sy);
+    sx = e.clientX; sy = e.clientY;
+    apply();
+  });
+})();
+
+// Search
+function renderResults(payload) {
+  const {results: arr} = payload;
+  if (!arr || !arr.length) {
+    results.innerHTML = '<div class="muted">No results</div>';
+    return;
+  }
+  results.innerHTML = '';
+  for (const r of arr) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    const head = document.createElement('div');
+    head.className = 'doc';
+    head.innerHTML = `${r.doc_id}
+      <span class="badge">${r.total_hits} hit${r.total_hits>1?'s':''}</span>
+      ${r.has_more ? '<span class="badge">has more...</span>' : ''}`;
+    card.appendChild(head);
+
+    for (const h of r.hits) {
+      const div = document.createElement('div');
+      div.className = 'hit';
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      let pm = [];
+      if (h.page) pm.push(`Page ${h.page}`);
+      if (h.line) pm.push(`Line ${h.line}`);
+      meta.textContent = `Hit: ${pm.join(', ') || '-'}`;
+      div.appendChild(meta);
+
+      const body = document.createElement('div');
+      body.innerHTML = `<div>${h.snippet_html || ''}</div>`;
+      if (h.snapshot_url) {
+        const img = new Image();
+        img.className = 'thumb';
+        img.src = h.snapshot_url;
+        img.alt = 'snapshot';
+        img.onclick = () => openModal(h.snapshot_url);
+        body.appendChild(img);
+      }
+      div.appendChild(body);
+      card.appendChild(div);
+    }
+    results.appendChild(card);
+  }
+}
+
+go.onclick = async () => {
+  const body = {
+    q: q.value || '',
+    mode: 'default',
+    all_hits: !!allHits.checked,
+    // UI remains the same; backend supports both knobs:
+    max_hits_per_doc: 3,
+    context_lines: 1,
+  };
+  const r = await fetch('/search', {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const j = await r.json();
+  renderResults(j);
+};
+
+refreshState();
+</script>
+</body>
+</html>
+        """
+    )
