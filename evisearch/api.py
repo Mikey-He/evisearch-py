@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import threading
 from typing import Annotated, Any
+import urllib.parse as ul
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -124,6 +125,12 @@ class FileListOut(BaseModel):
 
 
 # Helpers
+
+def _terms_qs(terms: list[str]) -> str:
+    if not terms:
+        return ""
+    qs = ",".join(ul.quote_plus(t) for t in terms if t)
+    return f"&terms={qs}"
 
 def _safe_doc_id(name: str) -> str:
     """Create safe document ID from filename"""
@@ -402,6 +409,7 @@ def _perform_search(
                             f"&page={table.page}"
                             f"&x0={table.bbox[0]}&y0={table.bbox[1]}"
                             f"&x1={table.bbox[2]}&y1={table.bbox[3]}"
+                            f"{_terms_qs(terms)}&scale=3"
                         )
                         shown_pages[doc_id].add(page)
                     out_hits.append(table)
@@ -412,8 +420,9 @@ def _perform_search(
                     if page not in shown_pages[doc_id]:
                         snippet.snapshot_url = (
                             f"/page-snapshot?doc_id={doc_id}&page={page}"
-                            f"&x0=0&y0=0&x1=612&y1=792"  # Full page
-                        )
+                            f"&x0=0&y0=0&x1=612&y1=792"
+                            f"{_terms_qs(terms)}&scale=3"
+                          )
                         shown_pages[doc_id].add(page)
                     out_hits.append(snippet)
             
@@ -1130,33 +1139,40 @@ def page_snapshot(
     y0: float = 0,
     x1: float = 612,
     y1: float = 792,
+    terms: str | None = None,         
+    scale: float = 3.0,     # DPI scaling factor (1.0-4.0
 ):
-    """Generate PNG snapshot of a PDF page region"""
+    """Generate high-DPI PNG snapshot of a PDF page region with term highlights."""
     pdf_path = _DOC_PATHS.get(doc_id)
     if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(404, "file not found")
 
-    # Load PDF and render page
+    # clamp scale to reasonable range
+    if not (1.0 <= scale <= 4.0):
+        scale = 3.0
+
     doc = fitz.open(pdf_path)  # type: ignore[no-untyped-call]
     try:
         p = doc.load_page(page - 1)  # 0-based
-        # Render page to image
-        pix = p.get_pixmap()  # type: ignore[no-untyped-call]
+        term_list: list[str] = []
+        if terms:
+            # split by comma or whitespace, ignore empty
+            term_list = [t for t in re.split(r"[,\s]+", terms) if t]
+
+        if term_list:
+            flags = fitz.TEXT_IGNORECASE  # type: ignore[attr-defined]
+            for t in term_list:
+                for r in p.search_for(t, flags=flags):
+                    # Add highlight annotation
+                    p.add_highlight_annot(r)
+
+        clip_rect = fitz.Rect(x0, y0, x1, y1)
+        mat = fitz.Matrix(scale, scale)
+        pix = p.get_pixmap(matrix=mat, clip=clip_rect)  # type: ignore[no-untyped-call]
+
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-        # Map PDF coords to image coords
-        rect = p.mediabox  
-        sx = pix.width / float(rect.width)
-        sy = pix.height / float(rect.height)
-        crop_box = (
-            int(max(0, min(pix.width,  x0 * sx))),
-            int(max(0, min(pix.height, y0 * sy))),
-            int(max(0, min(pix.width,  x1 * sx))),
-            int(max(0, min(pix.height, y1 * sy))),
-        )
-        img = img.crop(crop_box)
-
-        # Optional: draw border
+        # Add border
         draw = ImageDraw.Draw(img)
         w, h = img.size
         draw.rectangle([(0, 0), (w - 1, h - 1)], outline=(43, 58, 85))
