@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 # App & global state
 # =========================
 
-app = FastAPI(title="EviSearch-Py", version="1.4.2")
+app = FastAPI(title="EviSearch-Py", version="1.5.0")
 
 DATA_DIR = Path("data")
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -27,10 +27,15 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 _INDEX_LOCK = threading.Lock()
 
+# tuning knobs
+DEFAULT_MAX_PAGES_PER_DOC = 3
+CROP_PAD_RATIO = 0.04  # 4% padding around union box
+RENDER_SCALE = 2  # 2x rendering for snapshots
 
 # =========================
 # Indexing primitives
 # =========================
+
 
 class Analyzer:
     """Lightweight text analyzer used for tokenization and line splitting."""
@@ -187,24 +192,24 @@ INDEX = InvertedIndex()
 # doc_id (original filename with extension) -> file path on disk
 _DOC_PATHS: dict[str, str] = {}
 
-
 # =========================
 # Pydantic models
 # =========================
 
+
 class HitText(BaseModel):
     # Pydantic v2: use Literal instead of Field(const=True)
-    kind: Literal["text"] = "text"
+    kind: Literal["image", "text"] = "image"
     page: int | None = None
     line: int | None = None
-    snippet_html: str
+    snippet_html: str = ""
     snapshot_url: str | None = None
 
 
 class SearchDocResult(BaseModel):
     doc_id: str
     hits: list[HitText]
-    total_hits: int
+    total_hits: int  # pages for PDFs; lines for non-PDFs
     has_more: bool | None = None
 
 
@@ -227,6 +232,7 @@ class DeleteOut(BaseModel):
 # =========================
 # Helpers
 # =========================
+
 
 def sanitize_filename(name: str) -> str:
     """Make a filesystem-safe filename while keeping the extension."""
@@ -251,12 +257,30 @@ def highlight_html(text: str, terms: list[str]) -> str:
     return out
 
 
+def _union_rects(rects: list[fitz.Rect], page_rect: fitz.Rect) -> fitz.Rect:
+    if not rects:
+        return page_rect
+    x0 = min(r.x0 for r in rects)
+    y0 = min(r.y0 for r in rects)
+    x1 = max(r.x1 for r in rects)
+    y1 = max(r.y1 for r in rects)
+    # padding by ratio
+    pad_x = CROP_PAD_RATIO * page_rect.width
+    pad_y = CROP_PAD_RATIO * page_rect.height
+    x0 = max(page_rect.x0, x0 - pad_x)
+    y0 = max(page_rect.y0, y0 - pad_y)
+    x1 = min(page_rect.x1, x1 + pad_x)
+    y1 = min(page_rect.y1, y1 + pad_y)
+    return fitz.Rect(x0, y0, x1, y1)
+
+
 def make_text_snippet(
     doc_id: str,
     line_no: int,
     context_lines: int,
     terms: list[str],
 ) -> HitText:
+    """Used for non-PDF files: return highlighted HTML snippet."""
     lines = INDEX.lines.get(doc_id, [])
     lo = max(0, line_no - context_lines)
     hi = min(len(lines), line_no + context_lines + 1)
@@ -266,22 +290,13 @@ def make_text_snippet(
     html_block = html.escape(snippet).replace("\n", "<br/>")
     html_block = highlight_html(html_block, terms)
 
-    page = INDEX.which_page(doc_id, line_no)
-    snapshot: str | None = None
-    if page is not None and _DOC_PATHS.get(doc_id, "").lower().endswith(".pdf"):
-        snapshot = f"/page-snapshot?doc_id={html.escape(doc_id)}&page={page}"
-
-    return HitText(
-        page=page,
-        line=line_no + 1,
-        snippet_html=html_block,
-        snapshot_url=snapshot,
-    )
+    return HitText(kind="text", page=None, line=line_no + 1, snippet_html=html_block)
 
 
 # =========================
 # Indexing & file mgmt
 # =========================
+
 
 @app.post("/index-files", response_model=IndexOut)
 async def index_files(
@@ -371,6 +386,81 @@ def delete_all_files() -> DeleteOut:
 # Search
 # =========================
 
+
+def _pages_from_lines(doc_id: str, line_nos: list[int]) -> list[int]:
+    pages = []
+    seen = set()
+    for ln in line_nos:
+        p = INDEX.which_page(doc_id, ln)
+        if p is None:
+            continue
+        if p not in seen:
+            pages.append(p)
+            seen.add(p)
+    pages.sort()
+    return pages
+
+
+def _build_pdf_hits_for_pages(
+    doc_id: str,
+    pages: list[int],
+    terms: list[str],
+) -> list[HitText]:
+    path = _DOC_PATHS.get(doc_id)
+    if not path:
+        return []
+    hits: list[HitText] = []
+    try:
+        doc = fitz.open(path)
+        for pno1 in pages:
+            pno0 = pno1 - 1
+            if pno0 < 0 or pno0 >= doc.page_count:
+                continue
+            pg = doc[pno0]
+            rects: list[fitz.Rect] = []
+            page_rect = pg.rect
+
+            # case-insensitive search by trying a few variants
+            variants: set[str] = set()
+            for t in terms:
+                if not t:
+                    continue
+                variants.add(t)
+                variants.add(t.upper())
+                variants.add(t.capitalize())
+
+            for v in variants:
+                try:
+                    rects.extend(pg.search_for(v))
+                except Exception:
+                    # ignore search failures for weird patterns
+                    pass
+
+            box = _union_rects(rects, page_rect)
+            # build snapshot URL with crop=1
+            x0, y0, x1, y1 = box
+            url = (
+                "/page-snapshot?"
+                f"doc_id={html.escape(doc_id)}&page={pno1}"
+                f"&x0={x0:.2f}&y0={y0:.2f}&x1={x1:.2f}&y1={y1:.2f}&crop=1"
+            )
+            hits.append(
+                HitText(
+                    kind="image",
+                    page=pno1,
+                    line=None,
+                    snippet_html="",
+                    snapshot_url=url,
+                )
+            )
+        return hits
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
 def _search_impl(
     q: str,
     mode: str,
@@ -392,17 +482,31 @@ def _search_impl(
 
     results: list[SearchDocResult] = []
 
-    for did, lines in doc_hits.items():
-        total = len(lines)
-        limit = total if all_hits else max_hits_per_doc
-        show = lines[:limit]
-
-        hits = [make_text_snippet(did, ln, context_lines, terms) for ln in show]
-
-        res = SearchDocResult(doc_id=did, hits=hits, total_hits=total)
-        if not all_hits and total > limit:
-            res.has_more = True
-        results.append(res)
+    for did, line_nos in doc_hits.items():
+        is_pdf = (_DOC_PATHS.get(did, "").lower().endswith(".pdf"))
+        if is_pdf:
+            # dedupe to pages; each page -> one image hit
+            pages = _pages_from_lines(did, line_nos)
+            total = len(pages)
+            limit = total if all_hits else min(max_hits_per_doc, total)
+            show_pages = pages[:limit]
+            hits = _build_pdf_hits_for_pages(did, show_pages, terms)
+            res = SearchDocResult(doc_id=did, hits=hits, total_hits=total)
+            if total > limit:
+                res.has_more = True
+            results.append(res)
+        else:
+            # non-PDF: keep textual snippets
+            total = len(line_nos)
+            limit = total if all_hits else min(max_hits_per_doc, total)
+            show_lines = line_nos[:limit]
+            hits = [
+                make_text_snippet(did, ln, context_lines, terms) for ln in show_lines
+            ]
+            res = SearchDocResult(doc_id=did, hits=hits, total_hits=total)
+            if total > limit:
+                res.has_more = True
+            results.append(res)
 
     return SearchOut(ok=True, q=q, results=results)
 
@@ -420,7 +524,7 @@ def search_get(
         mode=mode,
         doc_id=doc_id,
         all_hits=all_hits,
-        max_hits_per_doc=3,
+        max_hits_per_doc=DEFAULT_MAX_PAGES_PER_DOC,
         context_lines=1,
     )
 
@@ -430,13 +534,13 @@ class SearchIn(BaseModel):
     mode: str = Field(default="default", pattern="^(default|boolean)$")
     doc_id: str | None = None
     all_hits: bool = False
-    max_hits_per_doc: int = Field(default=3, ge=1, le=50)
+    max_hits_per_doc: int = Field(default=DEFAULT_MAX_PAGES_PER_DOC, ge=1, le=50)
     context_lines: int = Field(default=1, ge=0, le=10)
 
 
 @app.post("/search", response_model=SearchOut)
 def search_post(body: Annotated[SearchIn, Body(...)]) -> SearchOut:
-    """POST search with controls for per-doc hit limit and snippet context lines."""
+    """POST search with per-doc hit limit and snippet context lines."""
     return _search_impl(
         q=body.q,
         mode=body.mode,
@@ -451,6 +555,7 @@ def search_post(body: Annotated[SearchIn, Body(...)]) -> SearchOut:
 # Page snapshot (PDF -> PNG)
 # =========================
 
+
 @app.get("/page-snapshot")
 def page_snapshot(
     doc_id: str = Query(...),
@@ -459,10 +564,12 @@ def page_snapshot(
     y0: float | None = None,
     x1: float | None = None,
     y1: float | None = None,
+    crop: int = Query(0, description="1 to crop to bbox; else draw rectangle on full page"),
 ) -> StreamingResponse:
     """
     Render a PDF page (or a highlighted box if bbox provided) to PNG.
-    If bbox is omitted, the whole page is returned.
+    - If crop=1 and bbox is provided, return the cropped region with a yellow border.
+    - Else return the whole page and draw a yellow rectangle if bbox is provided.
     """
     path = _DOC_PATHS.get(doc_id)
     if not path or not path.lower().endswith(".pdf"):
@@ -475,27 +582,41 @@ def page_snapshot(
             raise HTTPException(400, "Invalid page.")
         pg = doc[pno]
 
-        # Simple render at 2x scale.
-        pix = pg.get_pixmap(matrix=fitz.Matrix(2, 2))
+        pix = pg.get_pixmap(matrix=fitz.Matrix(RENDER_SCALE, RENDER_SCALE))
         img_bytes = pix.tobytes("png")
 
-        # If a bbox is provided, draw it using Pillow then return.
-        if None not in (x0, y0, x1, y1):
-            from PIL import Image, ImageDraw  # lazy import only if needed
+        from PIL import Image, ImageDraw  # lazy import inside function
+        img = Image.open(io.BytesIO(img_bytes))
 
-            img = Image.open(io.BytesIO(img_bytes))
+        if None not in (x0, y0, x1, y1):
+            # map from page coords to pixel coords
             rx, ry = pg.rect.width, pg.rect.height
             sx = img.width / rx
             sy = img.height / ry
-            box = (int(x0 * sx), int(y0 * sy), int(x1 * sx), int(y1 * sy))
-            draw = ImageDraw.Draw(img)
-            draw.rectangle(box, outline=(255, 204, 0), width=4)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            buf.seek(0)
-            return StreamingResponse(buf, media_type="image/png")
+            box_px = (int(x0 * sx), int(y0 * sy), int(x1 * sx), int(y1 * sy))
 
-        return StreamingResponse(io.BytesIO(img_bytes), media_type="image/png")
+            if crop:
+                # crop region and draw a thin border for context
+                crop_img = img.crop(box_px)
+                draw = ImageDraw.Draw(crop_img)
+                w = max(2, int(2 * (RENDER_SCALE / 2)))
+                draw.rectangle(
+                    (1, 1, crop_img.width - 2, crop_img.height - 2),
+                    outline=(255, 204, 0),
+                    width=w,
+                )
+                buf = io.BytesIO()
+                crop_img.save(buf, format="PNG")
+                buf.seek(0)
+                return StreamingResponse(buf, media_type="image/png")
+            else:
+                draw = ImageDraw.Draw(img)
+                draw.rectangle(box_px, outline=(255, 204, 0), width=4)
+
+        buf2 = io.BytesIO()
+        img.save(buf2, format="PNG")
+        buf2.seek(0)
+        return StreamingResponse(buf2, media_type="image/png")
     except HTTPException:
         raise
     except Exception as e:
@@ -506,6 +627,7 @@ def page_snapshot(
 # Status
 # =========================
 
+
 @app.get("/", response_class=JSONResponse)
 def root_status() -> dict[str, int | str]:
     return {"app": "EviSearch-Py", "docs": INDEX.docs()}
@@ -515,10 +637,12 @@ def root_status() -> dict[str, int | str]:
 # Inline UI (style preserved)
 # =========================
 
+
 @app.get("/ui", response_class=HTMLResponse)
 def ui_page() -> HTMLResponse:
     # Keep the existing dark, rounded, badge + <mark> highlight style.
-    # Only add missing behaviors (cancel upload, lightbox zoom/pan, REST deletes).
+    # Change behavior only: per-doc "Show all hits", window-level DnD,
+    # PDF-only image hits.
     return HTMLResponse(
         """
 <!doctype html>
@@ -554,8 +678,8 @@ progress{width:120px;height:10px}
 .input{flex:1;background:#0e1420;border:1px solid var(--line);color:var(--fg);
   padding:8px 10px;border-radius:10px}
 .card{background:#0e1420;border:1px solid #20304e;border-radius:14px;padding:12px 14px;margin:12px 0}
-.doc{font-weight:600;margin-bottom:4px}
-meta{color:var(--muted)}
+.doc{font-weight:600;margin-bottom:4px; display:flex; align-items:center; gap:8px}
+.meta{color:var(--muted)}
 .hit{margin:12px 0;padding:12px;background:#0d1320;border-radius:10px}
 .hit .meta{color:var(--muted);font-size:14px;margin-bottom:8px}
 mark{background:var(--mark);color:#222}
@@ -568,12 +692,13 @@ img.thumb{max-width:420px;border:1px solid var(--line);border-radius:8px;cursor:
   color:#eee;font-size:28px;cursor:pointer}
 .bar{display:flex;gap:10px;margin:10px 0}
 .muted{color:var(--muted)}
+.toggle{display:inline-flex;align-items:center;gap:6px;margin-left:auto}
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>EviSearch-Py</h1>
-  <div class="sub">Multiple-file upload, multi-hit search with highlighting</div>
+  <div class="sub">Multiple-file upload, multi-hit search (PDF returns image crops)</div>
 
   <div class="zone" id="zone">
     <button class="btn" id="pickBtn">Pick files</button>
@@ -586,10 +711,6 @@ img.thumb{max-width:420px;border:1px solid var(--line);border-radius:8px;cursor:
 
   <div class="bar">
     <input id="q" class="input" placeholder="Search phrase..."/>
-    <label class="row">
-      <input type="checkbox" id="allHits"/>
-      <span class="muted">Show all hits</span>
-    </label>
     <button class="btn primary" id="go">Search</button>
   </div>
 
@@ -612,7 +733,6 @@ const filesBox = document.getElementById('files');
 const clearAllBtn = document.getElementById('clearAll');
 const stateEl = document.getElementById('state');
 const q = document.getElementById('q');
-const allHits = document.getElementById('allHits');
 const go = document.getElementById('go');
 const results = document.getElementById('results');
 
@@ -691,12 +811,14 @@ function handleFiles(fileList) {
   [...fileList].forEach(uploadOne);
 }
 
-zone.addEventListener('dragover', e => {
-  e.preventDefault(); zone.classList.add('drag');
+// window-level DnD (plus zone for style feedback)
+['dragover', 'drop'].forEach(ev => {
+  window.addEventListener(ev, e => e.preventDefault());
 });
-zone.addEventListener('dragleave', () => zone.classList.remove('drag'));
-zone.addEventListener('drop', e => {
-  e.preventDefault(); zone.classList.remove('drag');
+window.addEventListener('dragover', () => zone.classList.add('drag'));
+window.addEventListener('dragleave', () => zone.classList.remove('drag'));
+window.addEventListener('drop', e => {
+  zone.classList.remove('drag');
   const files = e.dataTransfer.files;
   if (files && files.length) handleFiles(files);
 });
@@ -769,49 +891,92 @@ document.addEventListener('keydown', e => {
   });
 })();
 
-// Search
+// ---- Search (per-doc Show all hits) ----
+
+function renderDocCard(result) {
+  // result: SearchDocResult
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.dataset.docId = result.doc_id;
+
+  const head = document.createElement('div');
+  head.className = 'doc';
+  head.innerHTML = `
+    <span>${result.doc_id}</span>
+    <span class="badge">${result.total_hits} hit${result.total_hits>1?'s':''}</span>
+  `;
+  const toggle = document.createElement('label');
+  toggle.className = 'toggle';
+  toggle.innerHTML = `
+    <input type="checkbox" ${result.has_more ? '' : 'checked'} />
+    <span class="muted">Show all hits</span>
+  `;
+  const cb = toggle.querySelector('input');
+  cb.checked = !result.has_more; // if no more -> treated as all shown
+  cb.onchange = async () => {
+    const wantAll = cb.checked;
+    const payload = {
+      q: window.__last_q || '',
+      mode: 'default',
+      doc_id: result.doc_id,
+      all_hits: wantAll,
+      max_hits_per_doc: ${DEFAULT_MAX_PAGES_PER_DOC},
+      context_lines: 1
+    };
+    const r = await fetch('/search', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const j = await r.json();
+    // j.results should contain one doc
+    if (j && j.results && j.results.length) {
+      const fresh = j.results[0];
+      const newCard = renderDocCard(fresh);
+      card.replaceWith(newCard);
+    }
+  };
+  head.appendChild(toggle);
+  card.appendChild(head);
+
+  for (const h of result.hits) {
+    const div = document.createElement('div');
+    div.className = 'hit';
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = h.page ? `Page ${h.page}` : '-';
+    div.appendChild(meta);
+
+    const body = document.createElement('div');
+    if (h.snapshot_url) {
+      const img = new Image();
+      img.className = 'thumb';
+      img.src = h.snapshot_url;
+      img.alt = 'snapshot';
+      img.onclick = () => openModal(h.snapshot_url);
+      body.appendChild(img);
+    } else if (h.snippet_html) {
+      // non-PDF textual fallback
+      const box = document.createElement('div');
+      box.innerHTML = h.snippet_html;
+      body.appendChild(box);
+    }
+    div.appendChild(body);
+    card.appendChild(div);
+  }
+  return card;
+}
+
 function renderResults(payload) {
-  const {results: arr} = payload;
-  if (!arr || !arr.length) {
+  const arr = payload.results || [];
+  results.innerHTML = '';
+  if (!arr.length) {
     results.innerHTML = '<div class="muted">No results</div>';
     return;
   }
-  results.innerHTML = '';
   for (const r of arr) {
-    const card = document.createElement('div');
-    card.className = 'card';
-    const head = document.createElement('div');
-    head.className = 'doc';
-    head.innerHTML = `${r.doc_id}
-      <span class="badge">${r.total_hits} hit${r.total_hits>1?'s':''}</span>
-      ${r.has_more ? '<span class="badge">has more...</span>' : ''}`;
-    card.appendChild(head);
-
-    for (const h of r.hits) {
-      const div = document.createElement('div');
-      div.className = 'hit';
-      const meta = document.createElement('div');
-      meta.className = 'meta';
-      let pm = [];
-      if (h.page) pm.push(`Page ${h.page}`);
-      if (h.line) pm.push(`Line ${h.line}`);
-      meta.textContent = `Hit: ${pm.join(', ') || '-'}`;
-      div.appendChild(meta);
-
-      const body = document.createElement('div');
-      body.innerHTML = `<div>${h.snippet_html || ''}</div>`;
-      if (h.snapshot_url) {
-        const img = new Image();
-        img.className = 'thumb';
-        img.src = h.snapshot_url;
-        img.alt = 'snapshot';
-        img.onclick = () => openModal(h.snapshot_url);
-        body.appendChild(img);
-      }
-      div.appendChild(body);
-      card.appendChild(div);
-    }
-    results.appendChild(card);
+    results.appendChild(renderDocCard(r));
   }
 }
 
@@ -819,11 +984,11 @@ go.onclick = async () => {
   const body = {
     q: q.value || '',
     mode: 'default',
-    all_hits: !!allHits.checked,
-    // UI remains the same; backend supports both knobs:
-    max_hits_per_doc: 3,
-    context_lines: 1,
+    all_hits: false, // initial: show first N pages per doc
+    max_hits_per_doc: ${DEFAULT_MAX_PAGES_PER_DOC},
+    context_lines: 1
   };
+  window.__last_q = body.q;
   const r = await fetch('/search', {
     method: 'POST',
     headers: {'content-type': 'application/json'},
