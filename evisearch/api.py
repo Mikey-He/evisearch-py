@@ -8,7 +8,7 @@ import re
 import threading
 from typing import Annotated, Any
 
-from fastapi import Body, Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import fitz  # PyMuPDF  # type: ignore[import-untyped]
@@ -1043,3 +1043,127 @@ refreshState();
 </body>
 </html>
 """)
+
+# Indexing and Search Endpoints
+
+def _rebuild_index_from_docs() -> None:
+    global _INDEX
+    writer = IndexWriter(_ANALYZER, index_stopwords=True)
+    for did, (text, page_map) in _DOC_DATA.items():
+        writer.add(did, text, page_map=page_map)
+    _INDEX = writer.commit()
+
+@app.post("/index-files", response_model=IndexOut, dependencies=[Depends(_check_auth)])
+async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: B008
+    if not files:
+        raise HTTPException(400, "no files")
+
+    added = 0
+    for f in files:
+        dest = UPLOAD_DIR / f.filename
+        with dest.open("wb") as w:
+            w.write(await f.read())
+
+        doc_id = _safe_doc_id(f.filename)
+        _DOC_PATHS[doc_id] = str(dest)
+
+        if f.filename.lower().endswith(".pdf"):
+            text, page_map = _extract_pdf_text_and_page_map(dest)
+        else:
+            text = dest.read_text(encoding="utf-8", errors="ignore")
+            page_map = []
+
+        _DOC_DATA[doc_id] = (text, page_map)
+        added += 1
+
+    with _INDEX_LOCK:
+        _rebuild_index_from_docs()
+
+    return IndexOut(ok=True, indexed=added, vocab=_INDEX.vocabulary_size() if _INDEX else 0)
+
+@app.get("/files", response_model=FileListOut, dependencies=[Depends(_check_auth)])
+def list_files() -> FileListOut:
+    return FileListOut(files=sorted(_DOC_DATA.keys()))
+
+@app.delete("/files/{name}", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
+def delete_file(name: str) -> DeleteOut:
+    doc_id = _safe_doc_id(name)
+    _DOC_DATA.pop(doc_id, None)
+    _DOC_PATHS.pop(doc_id, None)
+    p = UPLOAD_DIR / doc_id
+    if p.exists():
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+    with _INDEX_LOCK:
+        if _DOC_DATA:
+            _rebuild_index_from_docs()
+        else:
+
+            global _INDEX
+            _INDEX = None
+
+    return DeleteOut(ok=True, message=f"removed {doc_id}")
+
+@app.post("/search", response_model=SearchOut, dependencies=[Depends(_check_auth)])
+def search_endpoint(payload: SearchIn) -> SearchOut:
+    results = _perform_search(
+        payload.q,
+        mode=payload.mode,
+        doc_id_filter=payload.doc_id,
+        max_hits_per_doc=payload.max_hits_per_doc,
+        context_lines=payload.context_lines,
+    )
+    return SearchOut(results=results)
+
+@app.get(
+    "/page-snapshot",
+    response_class=StreamingResponse,
+    dependencies=[Depends(_check_auth)],
+)
+def page_snapshot(
+    doc_id: Annotated[str, Query(..., description="document id (= filename)")],
+    page: Annotated[int, Query(..., ge=1, description="1-based page number")],
+    x0: float = 0,
+    y0: float = 0,
+    x1: float = 612,
+    y1: float = 792,
+):
+    """Generate PNG snapshot of a PDF page region"""
+    pdf_path = _DOC_PATHS.get(doc_id)
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(404, "file not found")
+
+    # Load PDF and render page
+    doc = fitz.open(pdf_path)  # type: ignore[no-untyped-call]
+    try:
+        p = doc.load_page(page - 1)  # 0-based
+        # Render page to image
+        pix = p.get_pixmap()  # type: ignore[no-untyped-call]
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        # Map PDF coords to image coords
+        rect = p.mediabox  
+        sx = pix.width / float(rect.width)
+        sy = pix.height / float(rect.height)
+        crop_box = (
+            int(max(0, min(pix.width,  x0 * sx))),
+            int(max(0, min(pix.height, y0 * sy))),
+            int(max(0, min(pix.width,  x1 * sx))),
+            int(max(0, min(pix.height, y1 * sy))),
+        )
+        img = img.crop(crop_box)
+
+        # Optional: draw border
+        draw = ImageDraw.Draw(img)
+        w, h = img.size
+        draw.rectangle([(0, 0), (w - 1, h - 1)], outline=(43, 58, 85))
+
+        bio = io.BytesIO()
+        img.save(bio, format="PNG")
+        bio.seek(0)
+        return StreamingResponse(bio, media_type="image/png")
+    finally:
+        doc.close()
