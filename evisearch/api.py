@@ -657,13 +657,45 @@ html,body{background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,Segoe UI}
 h1{font-size:28px;margin:0 0 6px}
 .sub{color:var(--muted);margin:0 0 20px}
 .zone{
-  border:2px dashed #30405c;border-radius:14px;background:var(--card);
-  display:flex;gap:12px;align-items:center;flex-wrap:wrap;
-  padding:24px;         /* larger padding */
-  min-height:220px;     /* MUCH bigger drop target */
-  transition:outline .15s ease, box-shadow .15s ease;
+  position: relative;
+  border: 2px dashed #30405c;
+  border-radius: 14px;
+  background: var(--card);
+  /* bigger & breathable */
+  padding: 24px;
+  min-height: 260px;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+  transition: outline .15s ease, box-shadow .15s ease, background .15s ease;
 }
-.zone.drag{outline:2px solid #4b6cb7;box-shadow:0 0 0 4px rgba(75,108,183,.15) inset}
+
+/* overlay file input that makes the WHOLE zone clickable */
+.zone .zone-picker{
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+  /* ensure it receives click/drag events */
+  z-index: 1;
+}
+
+/* content holder above background, below overlay input */
+.zone .zone-inner{
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* drag feedback */
+.zone.drag{
+  outline: 2px solid #4b6cb7;
+  box-shadow: 0 0 0 4px rgba(75,108,183,.15) inset;
+}
 .btn{background:#1f2937;color:var(--fg);border:1px solid var(--line);border-radius:10px;
   padding:8px 12px;cursor:pointer}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#08110a}
@@ -701,12 +733,17 @@ img.thumb{max-width:420px;border:1px solid var(--line);border-radius:8px;cursor:
   <h1>EviSearch-Py</h1>
   <div class="sub">Multiple-file upload, multi-hit search (PDF returns image crops)</div>
 
-  <div class="zone" id="zone">
-    <button class="btn" id="pickBtn">Pick files</button>
-    <input id="picker" type="file" multiple style="display:none"/>
-    <button class="btn" id="clearAll">Clear All</button>
+  <div class="zone" id="zone" aria-label="Drop files here">
+  <!-- invisible input covers the whole zone; clicking anywhere opens picker -->
+  <input id="picker" class="zone-picker" type="file" multiple />
+  <div class="zone-inner">
+    <button class="btn" id="pickBtn" type="button">Pick files</button>
+    <button class="btn" id="clearAll" type="button">Clear All</button>
     <span id="state" class="badge">docs: --</span>
   </div>
+</div>
+
+<!-- keep your existing <div id="files"></div> below as-is -->
 
   <div id="files"></div>
 
@@ -727,15 +764,72 @@ img.thumb{max-width:420px;border:1px solid var(--line);border-radius:8px;cursor:
 </div>
 
 <script>
-const zone = document.getElementById('zone');
-const pickBtn = document.getElementById('pickBtn');
-const picker = document.getElementById('picker');
-const filesBox = document.getElementById('files');
-const clearAllBtn = document.getElementById('clearAll');
-const stateEl = document.getElementById('state');
-const q = document.getElementById('q');
-const go = document.getElementById('go');
-const results = document.getElementById('results');
+  // --- references (keep your existing ones if already defined) ---
+  const zone = document.getElementById('zone');
+  const picker = document.getElementById('picker');
+  const pickBtn = document.getElementById('pickBtn');
+  const clearAllBtn = document.getElementById('clearAll');
+  const filesBox = document.getElementById('files');
+  const stateEl = document.getElementById('state');
+
+  // 1) unified handler
+  function safeHandleFiles(fileList){
+    if (!fileList || !fileList.length) return;
+    // reuse your existing handleFiles(...) implementation
+    handleFiles(fileList);
+    // clear the input so selecting the same file twice still fires 'change'
+    if (picker) picker.value = '';
+  }
+
+  // 2) clicks
+  // (A) click ANYWHERE in the zone opens system picker, because the input covers whole zone
+  // (B) clicking the "Pick files" button also works (explicit)
+  pickBtn?.addEventListener('click', (e) => {
+    e.preventDefault();
+    picker?.click();
+  });
+  // NOTE: clicking anywhere in the zone already clicks the transparent input,
+  // so无需额外 zone.onclick 逻辑
+
+  // 3) input change (select files)
+  picker?.addEventListener('change', (e) => {
+    safeHandleFiles(picker.files);
+  });
+
+  // 4) robust DnD on zone itself (and stop bubbling to window)
+  let dragDepth = 0;
+  const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+
+  ['dragenter','dragover','dragleave','drop'].forEach(ev => {
+    zone.addEventListener(ev, stop, false);
+  });
+
+  zone.addEventListener('dragenter', () => {
+    dragDepth++;
+    zone.classList.add('drag');
+  }, false);
+
+  zone.addEventListener('dragleave', () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) zone.classList.remove('drag');
+  }, false);
+
+  zone.addEventListener('drop', (e) => {
+    dragDepth = 0;
+    zone.classList.remove('drag');
+    const files = e.dataTransfer?.files;
+    safeHandleFiles(files);
+  }, false);
+
+  // 5) optional: prevent the browser from opening the file when dropped outside the zone
+  ['dragover','drop'].forEach(ev => {
+    window.addEventListener(ev, function(e){
+      e.preventDefault();
+    }, false);
+  });
+
+  // keep your existing clearAllBtn.onclick / refreshState() etc. unchanged
+</script>
 
 function refreshState() {
   fetch('/', {cache:'no-store'}).then(r => r.json()).then(j => {
