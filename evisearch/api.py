@@ -6,7 +6,7 @@ import io
 from pathlib import Path
 import re
 import threading
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -14,8 +14,11 @@ import fitz  # PyMuPDF
 import pdfplumber
 from pydantic import BaseModel, Field
 
+# =========================
 # App & global state
-app = FastAPI(title="EviSearch-Py", version="1.4.1")
+# =========================
+
+app = FastAPI(title="EviSearch-Py", version="1.4.2")
 
 DATA_DIR = Path("data")
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -190,7 +193,8 @@ _DOC_PATHS: dict[str, str] = {}
 # =========================
 
 class HitText(BaseModel):
-    kind: str = Field(default="text", const=True)
+    # Pydantic v2: use Literal instead of Field(const=True)
+    kind: Literal["text"] = "text"
     page: int | None = None
     line: int | None = None
     snippet_html: str
