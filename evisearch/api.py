@@ -407,8 +407,8 @@ def _perform_search(
                         table.snapshot_url = (
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={table.page}"
-                            f"&x0={table.bbox[0]}&y0={table.bbox[1]}"
-                            f"&x1={table.bbox[2]}&y1={table.bbox[3]}"
+                            f"&full=1"
+                            f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
                             f"{_terms_qs(terms)}&scale=3"
                         )
                         shown_pages[doc_id].add(page)
@@ -419,10 +419,11 @@ def _perform_search(
                     # Generate page snapshot if not already shown
                     if page not in shown_pages[doc_id]:
                         snippet.snapshot_url = (
-                            f"/page-snapshot?doc_id={doc_id}&page={page}"
-                            f"&x0=0&y0=0&x1=612&y1=792"
+                            f"/page-snapshot?doc_id={doc_id}"
+                            f"&page={page}"
+                            f"&full=1"
                             f"{_terms_qs(terms)}&scale=3"
-                          )
+                        )
                         shown_pages[doc_id].add(page)
                     out_hits.append(snippet)
             
@@ -455,8 +456,9 @@ def _perform_search(
                         table.snapshot_url = (
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={table.page}"
-                            f"&x0={table.bbox[0]}&y0={table.bbox[1]}"
-                            f"&x1={table.bbox[2]}&y1={table.bbox[3]}"
+                            f"&full=1"
+                            f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
+                            f"{_terms_qs(terms)}&scale=3"
                         )
                         shown_pages[doc_id].add(page)
                     out_hits.append(table)
@@ -464,9 +466,11 @@ def _perform_search(
                     snippet = _paragraph_snippet(doc_id, pos, terms, context_lines)
                     if page not in shown_pages[doc_id]:
                         snippet.snapshot_url = (
-                            f"/page-snapshot?doc_id={doc_id}&page={page}"
-                            f"&x0=0&y0=0&x1=612&y1=792"
-                        )
+                            f"/page-snapshot?doc_id={doc_id}"
+                            f"&page={page}"
+                            f"&full=1"
+                            f"{_terms_qs(terms)}&scale=3"
+                          )
                         shown_pages[doc_id].add(page)
                     out_hits.append(snippet)
             
@@ -499,8 +503,9 @@ def _perform_search(
                         table.snapshot_url = (
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={table.page}"
-                            f"&x0={table.bbox[0]}&y0={table.bbox[1]}"
-                            f"&x1={table.bbox[2]}&y1={table.bbox[3]}"
+                            f"&full=1"
+                            f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
+                            f"{_terms_qs(terms)}&scale=3"
                         )
                         shown_pages[doc_id].add(page)
                     out_hits.append(table)
@@ -508,8 +513,10 @@ def _perform_search(
                     snippet = _paragraph_snippet(doc_id, pos, terms, context_lines)
                     if page not in shown_pages[doc_id]:
                         snippet.snapshot_url = (
-                            f"/page-snapshot?doc_id={doc_id}&page={page}"
-                            f"&x0=0&y0=0&x1=612&y1=792"
+                            f"/page-snapshot?doc_id={doc_id}"
+                            f"&page={page}"
+                            f"&full=1"
+                            f"{_terms_qs(terms)}&scale=3"
                         )
                         shown_pages[doc_id].add(page)
                     out_hits.append(snippet)
@@ -1135,44 +1142,75 @@ def search_endpoint(payload: SearchIn) -> SearchOut:
 def page_snapshot(
     doc_id: Annotated[str, Query(..., description="document id (= filename)")],
     page: Annotated[int, Query(..., ge=1, description="1-based page number")],
-    x0: float = 0,
+    x0: float = 0,  
     y0: float = 0,
     x1: float = 612,
     y1: float = 792,
-    terms: str | None = None,         
-    scale: float = 3.0,     # DPI scaling factor (1.0-4.0
+    full: bool = False,             
+    terms: str | None = None,        
+    boxes: str | None = None,        
+    scale: float = 3.0,              
 ):
-    """Generate high-DPI PNG snapshot of a PDF page region with term highlights."""
+    """High-DPI PNG snapshot; highlight terms and draw table boxes (yellow)."""
     pdf_path = _DOC_PATHS.get(doc_id)
     if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(404, "file not found")
 
-    # clamp scale to reasonable range
     if not (1.0 <= scale <= 4.0):
         scale = 3.0
+
+    # Parse boxes
+    box_list: list[tuple[float, float, float, float]] = []
+    if boxes:
+        try:
+            for seg in re.split(r"[|]", boxes):
+                if not seg:
+                    continue
+                xs = [float(v) for v in seg.split(",")]
+                if len(xs) == 4:
+                    box_list.append((xs[0], xs[1], xs[2], xs[3]))
+        except Exception:
+            box_list = []
+
+    # Parse terms
+    term_list: list[str] = []
+    if terms:
+        term_list = [t for t in re.split(r"[,\s]+", terms) if t]
 
     doc = fitz.open(pdf_path)  # type: ignore[no-untyped-call]
     try:
         p = doc.load_page(page - 1)  # 0-based
-        term_list: list[str] = []
-        if terms:
-            # split by comma or whitespace, ignore empty
-            term_list = [t for t in re.split(r"[,\s]+", terms) if t]
 
+        # highlight terms
         if term_list:
             flags = fitz.TEXT_IGNORECASE  # type: ignore[attr-defined]
             for t in term_list:
                 for r in p.search_for(t, flags=flags):
-                    # Add highlight annotation
-                    p.add_highlight_annot(r)
+                    p.add_highlight_annot(r) 
 
-        clip_rect = fitz.Rect(x0, y0, x1, y1)
+        #  draw boxes
+        for (bx0, by0, bx1, by1) in box_list:
+            rect = fitz.Rect(bx0, by0, bx1, by1)
+            ann = p.add_rect_annot(rect)
+            try:
+                ann.set_colors(stroke=(1, 1, 0))  # yellow
+                ann.set_border(width=2)
+                ann.update()
+            except Exception:
+                pass
+
+        # get pixmap
+        if full:
+            clip_rect = p.mediabox
+        else:
+            clip_rect = fitz.Rect(x0, y0, x1, y1)
+
         mat = fitz.Matrix(scale, scale)
         pix = p.get_pixmap(matrix=mat, clip=clip_rect)  # type: ignore[no-untyped-call]
 
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-        # Add border
+        # 
         draw = ImageDraw.Draw(img)
         w, h = img.size
         draw.rectangle([(0, 0), (w - 1, h - 1)], outline=(43, 58, 85))
