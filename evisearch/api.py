@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 # App & global state
 # =========================
 
-app = FastAPI(title="EviSearch-Py", version="1.5.0")
+app = FastAPI(title="EviSearch-Py", version="1.5.1")
 
 DATA_DIR = Path("data")
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -433,11 +433,9 @@ def _build_pdf_hits_for_pages(
                 try:
                     rects.extend(pg.search_for(v))
                 except Exception:
-                    # ignore search failures for weird patterns
                     pass
 
             box = _union_rects(rects, page_rect)
-            # build snapshot URL with crop=1
             x0, y0, x1, y1 = box
             url = (
                 "/page-snapshot?"
@@ -640,9 +638,7 @@ def root_status() -> dict[str, int | str]:
 
 @app.get("/ui", response_class=HTMLResponse)
 def ui_page() -> HTMLResponse:
-    # Keep the existing dark, rounded, badge + <mark> highlight style.
-    # Change behavior only: per-doc "Show all hits", window-level DnD,
-    # PDF-only image hits.
+    # Preserve dark theme and rounded style; enlarge drop zone; add robust DnD and zone-click.
     return HTMLResponse(
         """
 <!doctype html>
@@ -660,9 +656,14 @@ html,body{background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,Segoe UI}
 .wrap{max-width:960px;margin:32px auto;padding:0 16px}
 h1{font-size:28px;margin:0 0 6px}
 .sub{color:var(--muted);margin:0 0 20px}
-.zone{border:2px dashed #30405c;border-radius:14px;padding:18px;background:var(--card);
-  display:flex;gap:12px;align-items:center}
-.zone.drag{outline:2px solid #4b6cb7}
+.zone{
+  border:2px dashed #30405c;border-radius:14px;background:var(--card);
+  display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+  padding:24px;         /* larger padding */
+  min-height:220px;     /* MUCH bigger drop target */
+  transition:outline .15s ease, box-shadow .15s ease;
+}
+.zone.drag{outline:2px solid #4b6cb7;box-shadow:0 0 0 4px rgba(75,108,183,.15) inset}
 .btn{background:#1f2937;color:var(--fg);border:1px solid var(--line);border-radius:10px;
   padding:8px 12px;cursor:pointer}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#08110a}
@@ -811,16 +812,38 @@ function handleFiles(fileList) {
   [...fileList].forEach(uploadOne);
 }
 
-// window-level DnD (plus zone for style feedback)
-['dragover', 'drop'].forEach(ev => {
-  window.addEventListener(ev, e => e.preventDefault());
+// ---- Robust DnD (window + zone), with drag counter ----
+let dragCounter = 0;
+function prevent(e){ e.preventDefault(); e.stopPropagation(); }
+
+['dragenter','dragover','dragleave','drop'].forEach(ev => {
+  window.addEventListener(ev, prevent);
 });
-window.addEventListener('dragover', () => zone.classList.add('drag'));
-window.addEventListener('dragleave', () => zone.classList.remove('drag'));
+window.addEventListener('dragenter', () => { dragCounter++; zone.classList.add('drag'); });
+window.addEventListener('dragleave', () => { dragCounter = Math.max(0, dragCounter-1); if (!dragCounter) zone.classList.remove('drag'); });
 window.addEventListener('drop', e => {
-  zone.classList.remove('drag');
-  const files = e.dataTransfer.files;
+  dragCounter = 0; zone.classList.remove('drag');
+  const files = e.dataTransfer && e.dataTransfer.files;
   if (files && files.length) handleFiles(files);
+});
+
+// Zone-specific handlers (some browsers require a real drop target)
+['dragenter','dragover','dragleave','drop'].forEach(ev => {
+  zone.addEventListener(ev, prevent);
+});
+zone.addEventListener('dragenter', () => zone.classList.add('drag'));
+zone.addEventListener('dragleave', () => zone.classList.remove('drag'));
+zone.addEventListener('drop', e => {
+  zone.classList.remove('drag');
+  const files = e.dataTransfer && e.dataTransfer.files;
+  if (files && files.length) handleFiles(files);
+});
+
+// Zone click opens file picker (except when clicking buttons)
+zone.addEventListener('click', (e) => {
+  const t = e.target;
+  if (t.closest('button') || t.tagName === 'INPUT') return;
+  picker.click();
 });
 
 pickBtn.onclick = () => picker.click();
@@ -929,7 +952,6 @@ function renderDocCard(result) {
       body: JSON.stringify(payload)
     });
     const j = await r.json();
-    // j.results should contain one doc
     if (j && j.results && j.results.length) {
       const fresh = j.results[0];
       const newCard = renderDocCard(fresh);
