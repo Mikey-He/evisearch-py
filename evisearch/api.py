@@ -602,7 +602,13 @@ def ui_page() -> HTMLResponse:
       min-height: 100vh; 
     }
 
-    .wrap { max-width: 960px; margin: 32px auto; padding: 0 16px; position: relative; }
+    .wrap { 
+      max-width: 960px; 
+      margin: 0 auto; 
+      padding: 32px 16px; 
+      position: relative; 
+    }
+                        
     h1 { font-size: 32px; margin: 0 0 8px; font-weight: 700; }
     .sub { color: var(--fg-muted); margin-bottom: 24px; }
 
