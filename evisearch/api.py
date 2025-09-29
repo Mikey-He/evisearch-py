@@ -696,6 +696,11 @@ def ui_page() -> HTMLResponse:
   </div>
   <div id="files" class="list"></div>
 
+  <div id="deleteAllContainer" style="text-align: right; margin: 10px 0; display: none;">
+      <button class="btn danger" id="deleteAllBtn">Delete All Files</button>
+  </div>
+  <div id="files" class="list"></div>
+                        
   <div class="controls">
     <input id="q" type="text"
       placeholder="Search (e.g., pue or &quot;power usage effectiveness&quot;)" />
@@ -721,6 +726,8 @@ const stateEl = document.getElementById('state');
 const q = document.getElementById('q');
 const go = document.getElementById('go');
 const results = document.getElementById('results');
+const deleteAllBtn = document.getElementById('deleteAllBtn');
+const deleteAllContainer = document.getElementById('deleteAllContainer');
 const lightbox = document.getElementById('lightbox');
 const lightboxImg = document.getElementById('lightboxImg');
 const lightboxClose = document.querySelector('.lightbox-close');
@@ -728,6 +735,41 @@ const lightboxClose = document.querySelector('.lightbox-close');
 let indexedFiles = new Map();
 let activeXHRs = new Map();
 
+// Helper function to show/hide the button based on file count
+function updateDeleteAllButtonVisibility() {
+  if (filesDiv.children.length > 0) {
+    deleteAllContainer.style.display = 'block';
+  } else {
+    deleteAllContainer.style.display = 'none';
+  }
+}
+
+// Add the click handler for the new delete all button
+deleteAllBtn.onclick = async () => {
+  if (!confirm('Are you sure you want to delete ALL indexed files? This action cannot be undone.')) {
+    return;
+  }
+
+  try {
+    const response = await fetch('/files', {
+      method: 'DELETE'
+    });
+
+    if (response.ok) {
+      filesDiv.innerHTML = ''; // Clear the file list UI
+      results.innerHTML = ''; // Clear search results
+      q.value = ''; // Reset search box
+      await refreshState(); // Update doc/vocab count
+      updateDeleteAllButtonVisibility(); // Hide the button
+    } else {
+      alert('Failed to delete all files.');
+    }
+  } catch (e) {
+    console.error('Error deleting all files:', e);
+    alert('An error occurred while deleting all files.');
+  }
+};
+                        
 // Lightbox state
 let scale = 1;
 let translateX = 0;
@@ -761,8 +803,14 @@ async function getFileList() {
   try {
     const r = await fetch('/files');
     const j = await r.json();
-    return j.files || [];
+    const fileList = j.files || [];
+    // After populating the list on load, update the button
+    // Using a timeout gives the DOM a moment to render before we check
+    setTimeout(updateDeleteAllButtonVisibility, 100); 
+    return fileList;
   } catch (e) {
+    // On error, also ensure the button is hidden
+    setTimeout(updateDeleteAllButtonVisibility, 100);
     return [];
   }
 }
@@ -801,6 +849,7 @@ async function removeFile(fileName, row) {
     if (response.ok) {
       row.remove();
       await refreshState();
+      updateDeleteAllButtonVisibility(); 
     } else {
       row.style.opacity = '1';
       alert('Failed to remove file');
@@ -842,6 +891,7 @@ async function startIndexSingle(file, row, fileId) {
     deleteBtn.style.display = 'block';
     
     await refreshState();
+    updateDeleteAllButtonVisibility();
   } catch (e) {
     row.querySelector('span').textContent = e.message === 'Aborted' ? 'cancelled' : 'error';
     activeXHRs.delete(fileId);
@@ -1154,6 +1204,32 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
 @app.get("/files", response_model=FileListOut, dependencies=[Depends(_check_auth)])
 def list_files() -> FileListOut:
     return FileListOut(files=sorted(_DOC_DATA.keys()))
+
+@app.delete("/files", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
+def delete_all_files() -> DeleteOut:
+    """Deletes all uploaded files and clears the index."""
+    global _INDEX
+    doc_ids_to_delete = list(_DOC_DATA.keys())
+
+    # Delete physical files
+    for doc_id in doc_ids_to_delete:
+        p = UPLOAD_DIR / doc_id
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:
+                # Log or ignore errors if a file is locked, etc.
+                pass
+
+    # Clear in-memory data stores
+    _DOC_DATA.clear()
+    _DOC_PATHS.clear()
+
+    # Reset the index
+    with _INDEX_LOCK:
+        _INDEX = None
+
+    return DeleteOut(ok=True, message="All files removed and index cleared.")
 
 @app.delete("/files/{name}", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
 def delete_file(name: str) -> DeleteOut:
