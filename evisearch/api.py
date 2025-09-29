@@ -1206,9 +1206,9 @@ def page_snapshot(
             clip_rect = fitz.Rect(x0, y0, x1, y1)
 
         mat = fitz.Matrix(scale, scale)
-        pix = p.get_pixmap(matrix=mat, clip=clip_rect)  # type: ignore[no-untyped-call]
-
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        pix = p.get_pixmap(matrix=mat, clip=clip_rect, alpha=False)  
+        buf = io.BytesIO(pix.tobytes("png")) 
+        img = Image.open(buf).convert("RGB")  
 
         # 
         draw = ImageDraw.Draw(img)
