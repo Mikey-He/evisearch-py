@@ -597,6 +597,7 @@ def ui_page() -> HTMLResponse:
       font-size: 16px;
       line-height: 1.6;
       transition: background-color 0.3s, color 0.3s;
+      min-height: 100vh; 
     }
 
     .wrap { max-width: 960px; margin: 32px auto; padding: 0 16px; position: relative; }
