@@ -554,89 +554,176 @@ def ui_page() -> HTMLResponse:
   <meta charset="utf-8"/>
   <title>EviSearch-Py</title>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg:#0b0f18; --fg:#e7eaf2; --muted:#9aa3b2; --card:#131a27;
-      --accent:#2ea043; --mark:#fff59d; --line:#2b3a55;
-      --danger:#dc3545;
+      /* --- Dark Mode Palette (Default) --- */
+      --bg: #121212;
+      --bg-secondary: #1E1E1E;
+      --fg: #E0E0E0;
+      --fg-muted: #888888;
+      --border: #333333;
+      --accent: #4CAF50;
+      --accent-hover: #66BB6A;
+      --danger: #F44336;
+      --danger-hover: #E57373;
+      --mark-bg: #FFF59D;
+      --mark-fg: #333;
+      --shadow: rgba(0, 0, 0, 0.2);
     }
-    html,body{
-      background:var(--bg); color:var(--fg);
-      font:16px/1.45 system-ui,Segoe UI,Roboto,Arial;
+
+    body.light-mode {
+      /* --- Light Mode Palette --- */
+      --bg: #F5F5F5;
+      --bg-secondary: #FFFFFF;
+      --fg: #212121;
+      --fg-muted: #757575;
+      --border: #E0E0E0;
+      --accent: #2E7D32;
+      --accent-hover: #388E3C;
+      --danger: #D32F2F;
+      --danger-hover: #E53935;
+      --mark-bg: #FFD54F;
+      --mark-fg: #212121;
+      --shadow: rgba(0, 0, 0, 0.1);
     }
-    .wrap{max-width:960px;margin:32px auto;padding:0 16px;}
-    h1{font-size:28px;margin:0 0 12px;}
-    .sub{color:var(--muted);margin-bottom:16px}
-    .zone{
-      border:2px dashed #30405c; border-radius:14px; 
-      padding:48px 24px; /* Increased padding for larger drop area */
-      min-height:180px; /* Minimum height for larger area */
-      display:flex; flex-direction:column; gap:16px; 
-      align-items:center; justify-content:center;
-      background:var(--card); position:relative;
+
+    html, body {
+      background: var(--bg);
+      color: var(--fg);
+      font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.6;
+      transition: background-color 0.3s, color 0.3s;
     }
-    .zone.drag{outline:2px solid #4b6cb7}
-    .zone-content{display:flex;gap:12px;align-items:center;}
-    .btn{
-      background:#1f2937; color:var(--fg);
-      border:1px solid var(--line); border-radius:10px;
-      padding:8px 12px; cursor:pointer
+
+    .wrap { max-width: 960px; margin: 32px auto; padding: 0 16px; position: relative; }
+    h1 { font-size: 32px; margin: 0 0 8px; font-weight: 700; }
+    .sub { color: var(--fg-muted); margin-bottom: 24px; }
+
+
+        /* --- Theme Toggle --- */
+    .theme-toggle {
+      position: absolute;
+      top: 8px;
+      right: 16px;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      color: var(--fg);
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      transition: all 0.3s ease;
     }
-    .btn.primary{background:#2ea043;border-color:#2ea043;color:#08110a}
-    .btn.danger{
-      background:transparent; color:var(--danger);
-      border:none; padding:4px; cursor:pointer;
-      font-size:20px; line-height:1;
-    }
-    .btn.danger:hover{color:#ff4458;}
-    .btn.cancel{
-      background:#dc3545; color:#fff;
-      border:1px solid #dc3545; border-radius:6px;
-      padding:4px 8px; cursor:pointer; font-size:12px;
-    }
-    .muted{color:var(--muted)}
-    .list{margin-top:10px}
-    .file{
-      display:flex; align-items:center; gap:10px; margin:8px 0; padding:8px;
-      border:1px solid var(--line); border-radius:10px; background:var(--card);
-      position: relative;
-    }
-    .file-name{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;}
-    progress{width:160px;height:10px}
-    .controls{display:flex;gap:10px;margin:18px 0}
-    input[type=text]{
-      flex:1; min-width:0; background:#0e1420;
-      border:1px solid var(--line); border-radius:10px; padding:10px; color:var(--fg)
-    }
-    .card{
-      margin:16px 0; padding:14px;
-      border:1px solid var(--line); border-radius:12px; background:var(--card);
-      /* Added data attribute to identify the document */
-    }
-    .doc{font-weight:700; margin-bottom:10px;}
-    .badge{
-      font-size:12px; color:#0b2913; background:#1c4e2f;
-      border:1px solid #2ea043; padding:1px 6px; border-radius:999px
-    }
-    pre.snippet{
-      white-space:pre-wrap; background:#0e1420;
-      border:1px solid #1d2a44; padding:10px; border-radius:10px;
-      margin:8px 0; display:none; /* Hide text snippets */
-    }
-    table.snippet-table{
-      border-collapse:collapse;background:#0e1420; margin:8px 0;
-      display:none; /* Hide table snippets */
-    }
-    mark{background:var(--mark);color:#222}
-    .hit{margin:12px 0; padding:12px; background:#0e1420; border-radius:8px;}
-    .hit .meta{color:var(--muted); font-size:14px; margin-bottom:8px;}
-    .hit img{
-      max-width:100%;
-      border:1px solid var(--line);
-      border-radius:8px;
-      cursor:zoom-in;
-    }
+    .theme-toggle:hover { background: var(--border); }
+    .theme-toggle .icon-sun { display: none; }
+    .theme-toggle .icon-moon { display: block; }
+    body.light-mode .theme-toggle .icon-sun { display: block; }
+    body.light-mode .theme-toggle .icon-moon { display: none; }                        
     
+    .zone {
+      border: 2px dashed var(--border);
+      border-radius: 12px;
+      padding: 48px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg-secondary);
+      position: relative;
+      transition: all 0.3s ease;
+    }
+    .zone.drag { border-color: var(--accent); background: rgba(76, 175, 80, 0.1); }
+    .zone-content { display: flex; gap: 12px; align-items: center; }
+    
+    .btn {
+      background: var(--bg-secondary);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 16px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 500;
+      transition: all 0.2s ease;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: #fff; }
+    .btn.danger { border: 1px solid var(--danger); color: var(--danger); }
+    .btn.danger:hover { background: var(--danger); color: #fff; }
+    
+    .btn.icon-btn { /* Style for single-file delete button */
+        background: transparent;
+        color: var(--fg-muted);
+        border: none;
+        padding: 4px;
+        font-size: 20px;
+        line-height: 1;
+    }
+    .btn.icon-btn:hover { color: var(--danger); }
+    
+    #deleteAllContainer { text-align: right; margin: 12px 0; }
+    #deleteAllBtn { font-size: 12px; padding: 6px 12px; } /* Smaller font for delete all */
+
+    .list { margin-top: 10px; }
+    .file {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 8px 0;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg-secondary);
+      box-shadow: 0 2px 4px var(--shadow);
+    }
+    .file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+    .controls { display: flex; gap: 10px; margin: 24px 0; }
+    input[type=text] {
+      flex: 1;
+      min-width: 0;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: var(--fg);
+      font-size: 16px;
+      transition: all 0.3s ease;
+    }
+    input[type=text]:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px rgba(76, 175, 80, 0.2); }
+
+    .card {
+      margin: 16px 0;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--bg-secondary);
+      box-shadow: 0 4px 8px var(--shadow);
+    }
+    .doc { font-weight: 500; margin-bottom: 10px; display: flex; align-items: center; gap: 10px; }
+    .badge {
+      font-size: 12px;
+      color: var(--accent);
+      background: rgba(76, 175, 80, 0.15);
+      border: 1px solid rgba(76, 175, 80, 0.3);
+      padding: 2px 8px;
+      border-radius: 999px;
+    }
+    mark { background: var(--mark-bg); color: var(--mark-fg); border-radius: 3px; padding: 1px 3px;}
+    .hit { margin: 12px 0; padding: 12px; background: var(--bg); border-radius: 8px; border: 1px solid var(--border); }
+    .hit .meta { color: var(--fg-muted); font-size: 14px; margin-bottom: 8px; }
+    .hit img { max-width: 100%; border: 1px solid var(--border); border-radius: 8px; cursor: zoom-in; }
+
     /* Lightbox styles */
     .lightbox{
       display:none; position:fixed; z-index:1000;
@@ -681,10 +768,12 @@ def ui_page() -> HTMLResponse:
 </head>
 <body>
 <div class="wrap">
+  <button class="theme-toggle" id="themeToggle" title="Toggle theme">
+      <span class="icon-moon">🌙</span>
+      <span class="icon-sun">☀️</span>
+  </button>
   <h1>EviSearch-Py</h1>
-  <div class="sub">
-    Drop PDFs/TXT here. Files index automatically. Then search (auto mode).
-  </div>
+  <div class="sub">Drop PDFs/TXT here. Files index automatically. Then search.</div>
 
   <div id="zone" class="zone">
     <div class="zone-content">
@@ -717,6 +806,36 @@ def ui_page() -> HTMLResponse:
 </div>
 
 <script>
+// --- START: All JavaScript code is now encapsulated in one block ---
+
+// Theme Toggle Logic
+const themeToggle = document.getElementById('themeToggle');
+const body = document.body;
+
+themeToggle.onclick = () => {
+    body.classList.toggle('light-mode');
+    if (body.classList.contains('light-mode')) {
+        localStorage.setItem('theme', 'light');
+    } else {
+        localStorage.setItem('theme', 'dark');
+    }
+};
+
+function applyInitialTheme() {
+    const savedTheme = localStorage.getItem('theme');
+    const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    if (savedTheme === 'light') {
+        body.classList.add('light-mode');
+    } else if (savedTheme === 'dark') {
+        // Already default, do nothing
+    } else if (prefersDark) {
+        // Default to system preference if no choice saved
+    } else {
+        body.classList.add('light-mode');
+    }
+}
+                        
+// Element Lookups
 const MAX_HITS_ALL = 50;
 const zone = document.getElementById('zone');
 const pick = document.getElementById('pick');
@@ -735,213 +854,156 @@ const lightboxClose = document.querySelector('.lightbox-close');
 let indexedFiles = new Map();
 let activeXHRs = new Map();
 
-// Helper function to show/hide the button based on file count
+// Lightbox state
+let scale = 1, translateX = 0, translateY = 0, isDragging = false, startX, startY;
+
+// Helper to manage "Delete All" button visibility
 function updateDeleteAllButtonVisibility() {
-  if (filesDiv.children.length > 0) {
-    deleteAllContainer.style.display = 'block';
-  } else {
-    deleteAllContainer.style.display = 'none';
-  }
+    deleteAllContainer.style.display = filesDiv.children.length > 0 ? 'block' : 'none';
 }
 
-// Add the click handler for the new delete all button
+// "Delete All" button event handler
 deleteAllBtn.onclick = async () => {
-  if (!confirm('Are you sure you want to delete ALL indexed files? This action cannot be undone.')) {
-    return;
-  }
-
-  try {
-    const response = await fetch('/files', {
-      method: 'DELETE'
-    });
-
-    if (response.ok) {
-      filesDiv.innerHTML = ''; // Clear the file list UI
-      results.innerHTML = ''; // Clear search results
-      q.value = ''; // Reset search box
-      await refreshState(); // Update doc/vocab count
-      updateDeleteAllButtonVisibility(); // Hide the button
-    } else {
-      alert('Failed to delete all files.');
+    if (!confirm('Are you sure you want to delete ALL indexed files? This cannot be undone.')) return;
+    try {
+        const response = await fetch('/files', { method: 'DELETE' });
+        if (response.ok) {
+            filesDiv.innerHTML = '';
+            results.innerHTML = '';
+            q.value = '';
+            await refreshState();
+            updateDeleteAllButtonVisibility();
+        } else {
+            alert('Failed to delete all files.');
+        }
+    } catch (e) {
+        console.error('Error deleting all files:', e);
+        alert('An error occurred while deleting all files.');
     }
-  } catch (e) {
-    console.error('Error deleting all files:', e);
-    alert('An error occurred while deleting all files.');
-  }
 };
-                        
-// Lightbox state
-let scale = 1;
-let translateX = 0;
-let translateY = 0;
-let isDragging = false;
-let startX, startY;
+
 
 choose.onclick = () => pick.click();
-
-['dragenter','dragover'].forEach(ev => zone.addEventListener(ev, e => {
-  e.preventDefault(); e.stopPropagation(); zone.classList.add('drag');
-}));
-['dragleave','drop'].forEach(ev => zone.addEventListener(ev, e => {
-  e.preventDefault(); e.stopPropagation(); zone.classList.remove('drag');
-}));
-zone.addEventListener('drop', e => {
-  const files = e.dataTransfer.files;
-  if (files && files.length) handleFiles(files);
-});
-pick.addEventListener('change', () => {
-  if (pick.files && pick.files.length) handleFiles(pick.files);
-});
+['dragenter', 'dragover'].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); zone.classList.add('drag'); }));
+['dragleave', 'drop'].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); zone.classList.remove('drag'); }));
+zone.addEventListener('drop', e => { if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); });
+pick.addEventListener('change', () => { if (pick.files.length) handleFiles(pick.files); });
 
 async function refreshState() {
-  const r = await fetch('/', {cache:'no-store'});
-  const j = await r.json();
-  stateEl.textContent = `docs: ${j.docs}, vocab: ${j.vocab}`;
+    const r = await fetch('/', { cache: 'no-store' });
+    const j = await r.json();
+    stateEl.textContent = `docs: ${j.docs}, vocab: ${j.vocab}`;
 }
 
 async function getFileList() {
-  try {
-    const r = await fetch('/files');
-    const j = await r.json();
-    const fileList = j.files || [];
-    // After populating the list on load, update the button
-    // Using a timeout gives the DOM a moment to render before we check
-    setTimeout(updateDeleteAllButtonVisibility, 100); 
-    return fileList;
-  } catch (e) {
-    // On error, also ensure the button is hidden
-    setTimeout(updateDeleteAllButtonVisibility, 100);
-    return [];
-  }
+    try {
+        const r = await fetch('/files');
+        const j = await r.json();
+        // This function is called on page load after the list is built in the main script flow
+        // The visibility will be updated there
+        return j.files || [];
+    } catch (e) {
+        return [];
+    }
 }
 
 function createFileRow(fileName, fileId) {
-  const row = document.createElement('div');
-  row.className = 'file';
-  row.dataset.fileId = fileId;
-  row.innerHTML = `
-    <div class="file-name">${fileName}</div>
-    <progress value="0" max="100"></progress>
-    <span class="muted">waiting</span>
-    <button class="btn cancel" style="display:none;">Cancel</button>
-    <button class="btn danger" style="display:none;" title="Remove file">×</button>
-  `;
-  
-  const deleteBtn = row.querySelector('.btn.danger');
-  const cancelBtn = row.querySelector('.btn.cancel');
-  
-  deleteBtn.onclick = () => removeFile(fileName, row);
-  cancelBtn.onclick = () => cancelUpload(fileId, row);
-  
-  return row;
+    const row = document.createElement('div');
+    row.className = 'file';
+    row.dataset.fileId = fileId;
+    row.innerHTML = `
+        <div class="file-name">${fileName}</div>
+        <progress value="0" max="100"></progress>
+        <span class="muted">waiting</span>
+        <button class="btn cancel" style="display:none;">Cancel</button>
+        <button class="btn icon-btn danger" style="display:none;" title="Remove file">×</button>
+    `;
+    const deleteBtn = row.querySelector('.btn.danger');
+    const cancelBtn = row.querySelector('.btn.cancel');
+    deleteBtn.onclick = () => removeFile(fileName, row);
+    cancelBtn.onclick = () => cancelUpload(fileId, row);
+    return row;
 }
 
+
 async function removeFile(fileName, row) {
-  if (!confirm('Remove this file from index?')) return;
-  
-  row.style.opacity = '0.5';
-  
-  try {
-    const response = await fetch(`/files/${encodeURIComponent(fileName)}`, {
-      method: 'DELETE'
-    });
-    
-    if (response.ok) {
-      row.remove();
-      await refreshState();
-      updateDeleteAllButtonVisibility(); 
-    } else {
-      row.style.opacity = '1';
-      alert('Failed to remove file');
+    if (!confirm('Remove this file from index?')) return;
+    row.style.opacity = '0.5';
+    try {
+        const response = await fetch(`/files/${encodeURIComponent(fileName)}`, { method: 'DELETE' });
+        if (response.ok) {
+            row.remove();
+            await refreshState();
+            updateDeleteAllButtonVisibility();
+        } else {
+            row.style.opacity = '1'; alert('Failed to remove file');
+        }
+    } catch (e) {
+        row.style.opacity = '1'; alert('Error removing file');
     }
-  } catch (e) {
-    row.style.opacity = '1';
-    alert('Error removing file');
-  }
 }
 
 function cancelUpload(fileId, row) {
-  const xhr = activeXHRs.get(fileId);
-  if (xhr) {
-    xhr.abort();
-    activeXHRs.delete(fileId);
-    row.remove();
-  }
+    const xhr = activeXHRs.get(fileId);
+    if (xhr) {
+        xhr.abort();
+        activeXHRs.delete(fileId);
+        row.remove();
+        updateDeleteAllButtonVisibility();
+    }
 }
 
 function handleFiles(fileList) {
-  const files = Array.from(fileList);
-  files.forEach(file => {
-    const fileId = `${file.name}_${Date.now()}_${Math.random()}`;
-    const row = createFileRow(file.name, fileId);
-    filesDiv.prepend(row);
-    startIndexSingle(file, row, fileId);
-  });
+    Array.from(fileList).forEach(file => {
+        const fileId = `${file.name}_${Date.now()}`;
+        const row = createFileRow(file.name, fileId);
+        filesDiv.prepend(row);
+        startIndexSingle(file, row, fileId);
+    });
 }
 
 async function startIndexSingle(file, row, fileId) {
-  try {
-    const cancelBtn = row.querySelector('.btn.cancel');
-    cancelBtn.style.display = 'block';
-    
-    await xhrUpload(file, row, fileId);
-    
-    cancelBtn.style.display = 'none';
-    const deleteBtn = row.querySelector('.btn.danger');
-    deleteBtn.style.display = 'block';
-    
-    await refreshState();
-    updateDeleteAllButtonVisibility();
-  } catch (e) {
-    row.querySelector('span').textContent = e.message === 'Aborted' ? 'cancelled' : 'error';
-    activeXHRs.delete(fileId);
-    if (e.message !== 'Aborted') {
-      console.error(e);
+    try {
+        const cancelBtn = row.querySelector('.btn.cancel');
+        cancelBtn.style.display = 'block';
+        await xhrUpload(file, row, fileId);
+        cancelBtn.style.display = 'none';
+        row.querySelector('.btn.danger').style.display = 'block';
+        await refreshState();
+        updateDeleteAllButtonVisibility();
+    } catch (e) {
+        if (e.message !== 'Aborted') console.error(e);
+        row.querySelector('span').textContent = e.message === 'Aborted' ? 'cancelled' : 'error';
+        activeXHRs.delete(fileId);
     }
-  }
 }
 
 function xhrUpload(file, row, fileId) {
-  return new Promise((resolve, reject) => {
-    const fd = new FormData();
-    fd.append('files', file);
-    
-    const xhr = new XMLHttpRequest();
-    activeXHRs.set(fileId, xhr);
-    
-    xhr.open('POST', '/index-files');
-    
-    xhr.upload.onprogress = e => {
-      if (e.lengthComputable) {
-        const p = Math.round((e.loaded / e.total) * 100);
-        row.querySelector('progress').value = p;
-        row.querySelector('span').textContent = `uploading ${p}%`;
-      }
-    };
-    
-    xhr.onload = () => {
-      activeXHRs.delete(fileId);
-      if (xhr.status >= 200 && xhr.status < 300) {
-        row.querySelector('progress').value = 100;
-        row.querySelector('span').textContent = 'indexed';
-        resolve();
-      } else {
-        reject(new Error('Upload failed'));
-      }
-    };
-    
-    xhr.onerror = () => {
-      activeXHRs.delete(fileId);
-      reject(new Error('Network error'));
-    };
-    
-    xhr.onabort = () => {
-      activeXHRs.delete(fileId);
-      reject(new Error('Aborted'));
-    };
-    
-    xhr.send(fd);
-  });
+    return new Promise((resolve, reject) => {
+        const fd = new FormData();
+        fd.append('files', file);
+        const xhr = new XMLHttpRequest();
+        activeXHRs.set(fileId, xhr);
+        xhr.open('POST', '/index-files');
+        xhr.upload.onprogress = e => {
+            if (e.lengthComputable) {
+                const p = Math.round((e.loaded / e.total) * 100);
+                row.querySelector('progress').value = p;
+                row.querySelector('span').textContent = `uploading ${p}%`;
+            }
+        };
+        xhr.onload = () => {
+            activeXHRs.delete(fileId);
+            if (xhr.status >= 200 && xhr.status < 300) {
+                row.querySelector('progress').value = 100;
+                row.querySelector('span').textContent = 'indexed';
+                resolve();
+            } else { reject(new Error('Upload failed')); }
+        };
+        xhr.onerror = () => { activeXHRs.delete(fileId); reject(new Error('Network error')); };
+        xhr.onabort = () => { activeXHRs.delete(fileId); reject(new Error('Aborted')); };
+        xhr.send(fd);
+    });
 }
 
 // Helper to convert hits data to HTML
@@ -957,7 +1019,7 @@ function createHitHtml(hits) {
       return '';
     }).join('');
 }
-
+                        
 
 async function doSearch() {
   results.innerHTML = '<div class="muted">Searching…</div>';
@@ -1011,7 +1073,7 @@ async function doSearch() {
   results.innerHTML = out.join('') || '<div class="muted">No results.</div>';
 }
 
-// 修复后的 showAllHits 函数
+// showAllHits 
 async function showAllHits(docId, currentQuery) {
   // Find the card element to update
   const card = document.querySelector(`.card[data-doc-id='${docId}']`);
@@ -1149,7 +1211,24 @@ document.addEventListener('keydown', e => {
 go.onclick = doSearch;
 q.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
 
+// Initial Page Load Actions
+applyInitialTheme();
 refreshState();
+// Logic to populate initial file list and then update button visibility
+(async () => {
+    const initialFiles = await getFileList();
+    filesDiv.innerHTML = '';
+    initialFiles.forEach(fileName => {
+        const row = createFileRow(fileName, fileName); // Use fileName as a simple ID
+        row.querySelector('progress').style.display = 'none';
+        row.querySelector('span').textContent = 'indexed';
+        row.querySelector('.btn.danger').style.display = 'block';
+        filesDiv.append(row);
+    });
+    updateDeleteAllButtonVisibility();
+})();
+
+// --- END: JavaScript block ---
 </script>
 </body>
 </html>
