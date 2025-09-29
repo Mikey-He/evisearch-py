@@ -713,6 +713,7 @@ def ui_page() -> HTMLResponse:
 </div>
 
 <script>
+const MAX_HITS_ALL = 50;
 const zone = document.getElementById('zone');
 const pick = document.getElementById('pick');
 const choose = document.getElementById('choose');
@@ -1243,12 +1244,33 @@ def page_snapshot(
             
         p = doc.load_page(page - 1)  # 0-based
 
-        # highlight terms
+        # highlight terms (case-insensitive without unavailable flags)
         if term_list:
-            flags = fitz.TEXT_IGNORECASE  # type: ignore[attr-defined]
+            def _search_rects_ci(page: fitz.Page, term: str):
+                # Try common case variants and deduplicate rectangles
+                variants = {term, term.lower(), term.upper(), term.title()}
+                rects = []
+                for v in variants:
+                    try:
+                        # PyMuPDF 1.26.4: search_for is case-sensitive; no TEXT_IGNORECASE flag.
+                        rects.extend(page.search_for(v))  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                # de-dup by rounded coords to avoid multi-variant duplicates
+                seen, out = set(), []
+                for r in rects:
+                    key = (round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2))
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(r)
+                return out
+
             for t in term_list:
-                for r in p.search_for(t, flags=flags):
-                    p.add_highlight_annot(r) 
+                for r in _search_rects_ci(p, t):
+                    try:
+                        p.add_highlight_annot(r)  # default highlight (yellow-ish)
+                    except Exception:
+                        pass
 
         #  draw boxes
         for (bx0, by0, bx1, by1) in box_list:
