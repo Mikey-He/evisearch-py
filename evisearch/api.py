@@ -139,18 +139,18 @@ def _safe_doc_id(name: str) -> str:
     # Keep original filename with extension as doc_id
     return base
 
-
 def _extract_pdf_text_and_page_map(
     path: Path,
 ) -> tuple[str, list[tuple[int, int]]]:
-    """Extract page texts and page_map"""
+    """Extract page texts and page_map using PyMuPDF (fitz)"""
     texts: list[str] = []
     page_map: list[tuple[int, int]] = []
     pos = 0
 
-    with pdfplumber.open(str(path)) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            txt = page.extract_text() or ""
+    with fitz.open(str(path)) as doc: # fitz
+        for i, page in enumerate(doc, start=1):
+            # Extract text with fallback to empty string
+            txt = page.get_text() or "" 
             texts.append(txt)
             toks = list(_ANALYZER.iter_tokens(txt, keep_stopwords=True))
             page_map.append((pos, i))
@@ -158,7 +158,6 @@ def _extract_pdf_text_and_page_map(
 
     joined = "\n\n".join(texts)
     return joined, page_map
-
 
 def _page_of_pos(doc_id: str, pos: int) -> int | None:
     """Get page number for token position"""
