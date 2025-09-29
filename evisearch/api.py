@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 from __future__ import annotations
 
 import html
@@ -23,7 +24,7 @@ from .searcher import PhraseMatcher, Searcher
 
 # App & global state
 
-app = FastAPI(title="EviSearch-Py", version="1.4.0")
+app = FastAPI(title="EviSearch-Py", version="1.4.1-FIXED") # Version update
 
 DATA_DIR = Path("data")
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -403,7 +404,7 @@ def _perform_search(
                 table = _table_snippet(doc_id, page - 1, terms)
                 if table:
                     # Only add snapshot if not already shown for this page
-                    if page not in shown_pages[doc_id]:
+                    if page not in shown_pages.get(doc_id, set()):
                         table.snapshot_url = (
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={table.page}"
@@ -411,20 +412,20 @@ def _perform_search(
                             f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
                             f"{_terms_qs(terms)}&scale=3"
                         )
-                        shown_pages[doc_id].add(page)
+                        shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
                 else:
                     # Fall back to text snippet
                     snippet = _paragraph_snippet(doc_id, st, terms, context_lines)
                     # Generate page snapshot if not already shown
-                    if page not in shown_pages[doc_id]:
+                    if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={page}"
                             f"&full=1"
                             f"{_terms_qs(terms)}&scale=3"
                         )
-                        shown_pages[doc_id].add(page)
+                        shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(snippet)
             
             results.append(ResultDoc(
@@ -452,7 +453,7 @@ def _perform_search(
                 
                 table = _table_snippet(doc_id, page - 1, terms)
                 if table:
-                    if page not in shown_pages[doc_id]:
+                    if page not in shown_pages.get(doc_id, set()):
                         table.snapshot_url = (
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={table.page}"
@@ -460,18 +461,18 @@ def _perform_search(
                             f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
                             f"{_terms_qs(terms)}&scale=3"
                         )
-                        shown_pages[doc_id].add(page)
+                        shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
                 else:
                     snippet = _paragraph_snippet(doc_id, pos, terms, context_lines)
-                    if page not in shown_pages[doc_id]:
+                    if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={page}"
                             f"&full=1"
                             f"{_terms_qs(terms)}&scale=3"
                           )
-                        shown_pages[doc_id].add(page)
+                        shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(snippet)
             
             results.append(ResultDoc(
@@ -499,7 +500,7 @@ def _perform_search(
                 
                 table = _table_snippet(doc_id, page - 1, terms)
                 if table:
-                    if page not in shown_pages[doc_id]:
+                    if page not in shown_pages.get(doc_id, set()):
                         table.snapshot_url = (
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={table.page}"
@@ -507,18 +508,18 @@ def _perform_search(
                             f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
                             f"{_terms_qs(terms)}&scale=3"
                         )
-                        shown_pages[doc_id].add(page)
+                        shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
                 else:
                     snippet = _paragraph_snippet(doc_id, pos, terms, context_lines)
-                    if page not in shown_pages[doc_id]:
+                    if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={page}"
                             f"&full=1"
                             f"{_terms_qs(terms)}&scale=3"
                         )
-                        shown_pages[doc_id].add(page)
+                        shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(snippet)
             
             results.append(ResultDoc(
@@ -610,7 +611,8 @@ def ui_page() -> HTMLResponse:
     }
     .card{
       margin:16px 0; padding:14px;
-      border:1px solid var(--line); border-radius:12px; background:var(--card)
+      border:1px solid var(--line); border-radius:12px; background:var(--card);
+      /* Added data attribute to identify the document */
     }
     .doc{font-weight:700; margin-bottom:10px;}
     .badge{
@@ -892,6 +894,21 @@ function xhrUpload(file, row, fileId) {
   });
 }
 
+// Helper to convert hits data to HTML
+function createHitHtml(hits) {
+    return hits.map((h, idx) => {
+      // Only show images, no text/table snippets in the UI
+      if (h.snapshot_url) {
+        return `<div class="hit">
+          <div class="meta">Hit ${idx + 1}${h.page ? ` - Page ${h.page}` : ''}</div>
+          <img src="${h.snapshot_url}" onclick="openLightbox(this.src)" alt="Page snapshot"/>
+        </div>`;
+      }
+      return '';
+    }).join('');
+}
+
+
 async function doSearch() {
   results.innerHTML = '<div class="muted">Searching…</div>';
   
@@ -901,16 +918,22 @@ async function doSearch() {
     context_lines: 2
   };
   
-  const r = await fetch('/search', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  });
-  
-  const j = await r.json();
+  let jsonResponse;
+  try {
+      const r = await fetch('/search', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      jsonResponse = await r.json();
+  } catch (e) {
+      results.innerHTML = '<div class="muted">Search error. Check console for details.</div>';
+      console.error("Search API call failed:", e);
+      return;
+  }
   
   const out = [];
-  for (const rdoc of j.results) {
+  for (const rdoc of jsonResponse.results) {
     const sc = rdoc.score !== undefined
       ? `<span class="badge">score ${rdoc.score.toFixed(3)}</span>` : '';
     
@@ -919,24 +942,18 @@ async function doSearch() {
       : '';
     
     const showAllLink = rdoc.has_more
-      ? `<span class="show-all" onclick="showAllHits('${rdoc.doc_id}')">Show all hits</span>`
+      // Pass the query value to showAllHits
+      ? `<span class="show-all" onclick="showAllHits('${rdoc.doc_id}', '${q.value.replace(/'/g, "\\'")}')">Show all hits</span>`
       : '';
     
-    // Only show images, no text
-    const hitHtml = rdoc.hits.map((h, idx) => {
-      if (h.snapshot_url) {
-        return `<div class="hit">
-          <div class="meta">Hit ${idx + 1}${h.page ? ` - Page ${h.page}` : ''}</div>
-          <img src="${h.snapshot_url}" onclick="openLightbox(this.src)" alt="Page snapshot"/>
-        </div>`;
-      }
-      return '';
-    }).join('');
+    const hitHtml = createHitHtml(rdoc.hits);
     
     out.push(
-      `<div class="card">
+      `<div class="card" data-doc-id="${rdoc.doc_id}">
         <div class="doc">${rdoc.doc_id} ${sc} ${ht} ${showAllLink}</div>
-        ${hitHtml}
+        <div class="hit-container">
+          ${hitHtml}
+        </div>
       </div>`
     );
   }
@@ -944,24 +961,52 @@ async function doSearch() {
   results.innerHTML = out.join('') || '<div class="muted">No results.</div>';
 }
 
-async function showAllHits(docId) {
+// 修复后的 showAllHits 函数
+async function showAllHits(docId, currentQuery) {
+  // Find the card element to update
+  const card = document.querySelector(`.card[data-doc-id='${docId}']`);
+  if (!card) return;
+  
+  const hitContainer = card.querySelector('.hit-container');
+  const showAllLink = card.querySelector('.show-all');
+  const hitBadge = card.querySelector('.doc .badge:nth-child(2)'); // Total hits badge
+
+  if (hitContainer) hitContainer.innerHTML = '<div class="muted" style="margin-left:10px;">Loading all hits...</div>';
+  if (showAllLink) showAllLink.style.display = 'none';
+
   const payload = {
-    q: q.value,
-    doc_id: docId,
-    max_hits_per_doc: 50,
+    q: currentQuery, // Use the query passed from doSearch
+    doc_id: docId, // Crucial: filter to this specific document
+    max_hits_per_doc: MAX_HITS_ALL, // Request the maximum number of hits (50)
     context_lines: 2
   };
   
-  const r = await fetch('/search', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  });
+  let jsonResponse;
+  try {
+    const r = await fetch('/search', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    jsonResponse = await r.json();
+  } catch (e) {
+    if (hitContainer) hitContainer.innerHTML = '<div class="muted" style="margin-left:10px;">Error loading all hits.</div>';
+    console.error(`Failed to load all hits for ${docId}:`, e);
+    return;
+  }
   
-  const j = await r.json();
+  const rdoc = jsonResponse.results[0];
+  if (!rdoc) return;
   
-  // Refresh search to show all results
-  await doSearch();
+  // 1. Update the hit container with ALL hits
+  if (hitContainer) {
+      hitContainer.innerHTML = createHitHtml(rdoc.hits);
+  }
+
+  // 2. Update the total hits badge
+  if (hitBadge) {
+      hitBadge.textContent = `${rdoc.total_hits} of ${rdoc.total_hits} hits`;
+  }
 }
 
 // Lightbox functions
@@ -1084,7 +1129,16 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
         _DOC_PATHS[doc_id] = str(dest)
 
         if f.filename.lower().endswith(".pdf"):
-            text, page_map = _extract_pdf_text_and_page_map(dest)
+            try:
+                text, page_map = _extract_pdf_text_and_page_map(dest)
+            except Exception as e:
+                # Add logging for PDF extraction failure
+                print(f"Error extracting PDF text for {f.filename}: {e}")
+                # Clean up the partially processed file/data if needed
+                if dest.exists():
+                    dest.unlink()
+                _DOC_PATHS.pop(doc_id, None)
+                continue # Skip this file and proceed to the next one
         else:
             text = dest.read_text(encoding="utf-8", errors="ignore")
             page_map = []
@@ -1175,10 +1229,18 @@ def page_snapshot(
     # Parse terms
     term_list: list[str] = []
     if terms:
-        term_list = [t for t in re.split(r"[,\s]+", terms) if t]
+        # Decode URL-encoded terms (e.g., "power%20usage" -> "power usage")
+        decoded_terms = ul.unquote_plus(terms)
+        # Split by comma or whitespace
+        term_list = [t for t in re.split(r"[,\s]+", decoded_terms) if t]
 
-    doc = fitz.open(pdf_path)  # type: ignore[no-untyped-call]
+    doc = None
     try:
+        # Open PDF
+        doc = fitz.open(pdf_path)  # type: ignore[no-untyped-call]
+        if page < 1 or page > doc.page_count:
+            raise HTTPException(404, f"Page {page} not found in {doc_id}")
+            
         p = doc.load_page(page - 1)  # 0-based
 
         # highlight terms
@@ -1213,11 +1275,30 @@ def page_snapshot(
         # 
         draw = ImageDraw.Draw(img)
         w, h = img.size
+        # Draw a subtle border around the image
         draw.rectangle([(0, 0), (w - 1, h - 1)], outline=(43, 58, 85))
 
         bio = io.BytesIO()
         img.save(bio, format="PNG")
         bio.seek(0)
         return StreamingResponse(bio, media_type="image/png")
+    
+    except HTTPException:
+        # Re-raise explicit HTTP errors (404, etc.)
+        raise
+        
+    except Exception as e:
+        # 捕获并记录其他所有异常，这是解决 500 问题的关键
+        import traceback
+        print(f"🚨 FATAL: Error generating snapshot for {doc_id} page {page}: {e}")
+        print(traceback.format_exc())
+        
+        # 返回 500 错误信息
+        raise HTTPException(  # noqa: B904
+            status_code=500, 
+            detail=f"Failed to generate page snapshot due to internal error. Check server logs for details. Error: {type(e).__name__}"
+        )
+        
     finally:
-        doc.close()
+        if doc:
+            doc.close()
