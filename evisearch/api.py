@@ -591,6 +591,8 @@ def ui_page() -> HTMLResponse:
     }
 
     html, body {
+      margin: 0;
+      padding: 0;
       background: var(--bg);
       color: var(--fg);
       font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -1465,12 +1467,10 @@ def page_snapshot(
         raise
         
     except Exception as e:
-        # 捕获并记录其他所有异常，这是解决 500 问题的关键
         import traceback
-        print(f"🚨 FATAL: Error generating snapshot for {doc_id} page {page}: {e}")
+        print(f"FATAL: Error generating snapshot for {doc_id} page {page}: {e}")
         print(traceback.format_exc())
         
-        # 返回 500 错误信息
         raise HTTPException(  # noqa: B904
             status_code=500, 
             detail=f"Failed to generate page snapshot due to internal error. Check server logs for details. Error: {type(e).__name__}"
