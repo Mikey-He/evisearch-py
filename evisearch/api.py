@@ -883,7 +883,6 @@ def ui_page() -> HTMLResponse:
       placeholder="Search (e.g., pue or &quot;power usage effectiveness&quot;)" />
     <button class="btn primary" id="go">Search</button>
   </div>
-
   <div id="results"></div>
 </div>
 
