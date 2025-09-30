@@ -7,7 +7,7 @@ services:
 
     buildCommand: "pip install -r requirements.txt"
 
-    startCommand: "gunicorn --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT evisearch.api:app"
+    startCommand: "gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT evisearch.api:app"
 
     envVars:
       - key: BASIC_USER
