@@ -442,7 +442,7 @@ def _perform_search(
                             f"&page={table.page}"
                             f"&full=1"
                             f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
-                            f"{_terms_qs(terms)}&scale=3"
+                            f"{_terms_qs(terms)}&scale=2"
                         )
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
@@ -455,7 +455,7 @@ def _perform_search(
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={page}"
                             f"&full=1"
-                            f"{_terms_qs(terms)}&scale=3"
+                            f"{_terms_qs(terms)}&scale=2"
                         )
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(snippet)
@@ -491,7 +491,7 @@ def _perform_search(
                             f"&page={table.page}"
                             f"&full=1"
                             f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
-                            f"{_terms_qs(terms)}&scale=3"
+                            f"{_terms_qs(terms)}&scale=2"
                         )
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
@@ -502,7 +502,7 @@ def _perform_search(
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={page}"
                             f"&full=1"
-                            f"{_terms_qs(terms)}&scale=3"
+                            f"{_terms_qs(terms)}&scale=2"
                           )
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(snippet)
@@ -538,7 +538,7 @@ def _perform_search(
                             f"&page={table.page}"
                             f"&full=1"
                             f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
-                            f"{_terms_qs(terms)}&scale=3"
+                            f"{_terms_qs(terms)}&scale=2"
                         )
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
@@ -549,7 +549,7 @@ def _perform_search(
                             f"/page-snapshot?doc_id={doc_id}"
                             f"&page={page}"
                             f"&full=1"
-                            f"{_terms_qs(terms)}&scale=3"
+                            f"{_terms_qs(terms)}&scale=2"
                         )
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(snippet)
