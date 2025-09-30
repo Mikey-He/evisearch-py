@@ -1427,6 +1427,8 @@ def delete_all_files() -> DeleteOut:
 
 @app.delete("/files/{name}", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
 def delete_file(name: str) -> DeleteOut:
+    global _INDEX, _FILENAME_TO_DOC_ID 
+    
     # Try to find doc_id from original filename first
     doc_id = _FILENAME_TO_DOC_ID.get(name)
     if not doc_id:
@@ -1441,7 +1443,6 @@ def delete_file(name: str) -> DeleteOut:
     _DOC_DATA.pop(doc_id, None)
     
     # Remove from filename mapping
-    global _FILENAME_TO_DOC_ID
     _FILENAME_TO_DOC_ID = {k: v for k, v in _FILENAME_TO_DOC_ID.items() if v != doc_id}
     
     # get the path to delete and remove from _DOC_PATHS
@@ -1461,7 +1462,6 @@ def delete_file(name: str) -> DeleteOut:
         if _DOC_DATA:
             _rebuild_index_from_docs()
         else:
-            global _INDEX
             _INDEX = None
 
     return DeleteOut(ok=True, message=f"removed {name}")
