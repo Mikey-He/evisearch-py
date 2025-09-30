@@ -137,17 +137,11 @@ def _terms_qs(terms: list[str]) -> str:
     return f"&terms={qs}"
 
 def _safe_doc_id(name: str) -> str:
-    """Create safe document ID from filename, replacing whitespace and special chars."""
-    import unicodedata
+    """Create safe document ID from filename."""
     base = os.path.basename(name or "doc")
-    # Normalize unicode characters
-    base = unicodedata.normalize('NFKD', base)
-    # Remove smart quotes and apostrophes
-    base = re.sub(r"['\u2018\u2019\u201C\u201D]", "", base)
-    # Replace whitespace with underscore
-    base = re.sub(r'\s+', '_', base)
-    # Replace other problematic characters with underscore
-    base = re.sub(r'[^\w\s\-\.]', '_', base)
+    # Don't modify the filename - just use it as-is
+    # Only replace truly problematic characters that might cause file system issues
+    base = base.replace('/', '_').replace('\\', '_').replace('\0', '_')
     return base
 
 def _extract_pdf_text_and_page_map(
