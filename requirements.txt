@@ -6,7 +6,6 @@ PyMuPDF==1.26.4
 pdfplumber==0.11.7
 pillow==11.3.0
 pytesseract==0.3.13
-python-docx==1.2.0
 
 # Additional dependencies
 annotated-types==0.7.0

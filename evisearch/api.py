@@ -6,7 +6,6 @@ import io
 import os
 from pathlib import Path
 import re
-import subprocess
 import threading
 from typing import Annotated, Any
 import urllib.parse as ul
@@ -1352,6 +1351,12 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
 
     added = 0
     for f in files:
+        # --- 开始替换的部分 ---
+        file_ext = (f.filename or "").lower().split('.')[-1]
+        if file_ext != "pdf":
+            print(f"INFO: Skipping non-PDF file: {f.filename}")
+            continue
+
         dest = UPLOAD_DIR / f.filename
         with dest.open("wb") as w:
             w.write(await f.read())
@@ -1359,61 +1364,15 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
         doc_id = _safe_doc_id(f.filename)
         _DOC_PATHS[doc_id] = str(dest)
 
-        text = ""
-        page_map = []
-
-        file_ext = f.filename.lower().split('.')[-1]
-
-        if file_ext == "pdf":
-            try:
-                text, page_map = _extract_pdf_text_and_page_map(dest)
-            except Exception as e:
-                print(f"Error extracting PDF text for {f.filename}: {e}")
-                if dest.exists():
-                    dest.unlink()
-                _DOC_PATHS.pop(doc_id, None)
-                continue
-        elif file_ext == "docx":
-            try:
-                # use libreoffice to convert to PDF first
-                print(f"INFO: Converting {f.filename} to PDF using LibreOffice...")
-                subprocess.run(
-                    [
-                        "libreoffice",
-                        "--headless",
-                        "--convert-to",
-                        "pdf",
-                        "--outdir",
-                        str(UPLOAD_DIR),
-                        str(dest),
-                    ],
-                    check=True,
-                    timeout=180, 
-                )
-                print(f"INFO: Conversion successful for {f.filename}.")
-
-                # make sure the PDF was created
-                pdf_path = dest.with_suffix(".pdf")
-                if not pdf_path.exists():
-                    raise FileNotFoundError("PDF conversion failed, output file not found.")
-                
-                # Update the document path to point to the new PDF file
-                _DOC_PATHS[doc_id] = str(pdf_path)
-
-                # extract text from the new PDF
-                text, page_map = _extract_pdf_text_and_page_map(pdf_path)
-
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-                print(f"ERROR: Failed to convert or process DOCX {f.filename}: {e}")
-                # if conversion or processing fails, clean up both DOCX and any partial PDF
-                if dest.exists():
-                    dest.unlink()
-                _DOC_PATHS.pop(doc_id, None)
-                continue
-        else: # Assume plain text
-            text = dest.read_text(encoding="utf-8", errors="ignore")
-            page_map = []
-
+        try:
+            text, page_map = _extract_pdf_text_and_page_map(dest)
+        except Exception as e:
+            print(f"Error extracting PDF text for {f.filename}: {e}")
+            if dest.exists():
+                dest.unlink()
+            _DOC_PATHS.pop(doc_id, None)
+            continue
+        
         _DOC_DATA[doc_id] = (text, page_map)
         added += 1
 
@@ -1455,32 +1414,16 @@ def delete_all_files() -> DeleteOut:
 @app.delete("/files/{name}", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
 def delete_file(name: str) -> DeleteOut:
     doc_id = _safe_doc_id(name)
-    
-    # If the doc_id does not exist, return 404
     _DOC_DATA.pop(doc_id, None)
     
-    # get the path to delete and remove from _DOC_PATHS
-    path_str_to_delete = _DOC_PATHS.pop(doc_id, None)
-
-    if path_str_to_delete:
-        path_to_delete = Path(path_str_to_delete)
-        
-        # logic to also delete associated .docx if the main file is a .pdf
-        if path_to_delete.suffix.lower() == ".pdf":
-            docx_equivalent = path_to_delete.with_suffix(".docx")
-            if docx_equivalent.exists():
-                try:
-                    docx_equivalent.unlink()
-                    print(f"INFO: Deleted associated DOCX: {docx_equivalent.name}")
-                except Exception as e:
-                    print(f"WARN: Could not delete associated DOCX {docx_equivalent.name}: {e}")
-        
-        # delete the main file
-        if path_to_delete.exists():
+    path_str = _DOC_PATHS.pop(doc_id, None)
+    if path_str:
+        p = Path(path_str)
+        if p.exists():
             try:
-                path_to_delete.unlink()
-            except Exception as e:
-                print(f"WARN: Could not delete file {path_to_delete.name}: {e}")
+                p.unlink()
+            except Exception:
+                pass
 
     with _INDEX_LOCK:
         if _DOC_DATA:

@@ -15,4 +15,4 @@ services:
       - key: BASIC_PASS
         value: ""
       - key: NATIVE_PACKAGES
-        value: "libreoffice tesseract-ocr tesseract-ocr-eng"
+        value: "tesseract-ocr tesseract-ocr-eng"
