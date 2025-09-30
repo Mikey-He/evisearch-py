@@ -5,7 +5,10 @@ services:
     plan: standard  
     region: oregon
 
-    buildCommand: "pip install -r requirements.txt"
+    buildCommand: |
+      apt-get update
+      apt-get install -y tesseract-ocr tesseract-ocr-eng
+      pip install -r requirements.txt
 
     startCommand: "gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT evisearch.api:app"
 
