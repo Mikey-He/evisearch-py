@@ -159,10 +159,10 @@ def _terms_qs(terms: list[str]) -> str:
     return f"&terms={qs}"
 
 def _safe_doc_id(name: str) -> str:
-    """Create safe document ID from filename"""
+    """Create safe document ID from filename, replacing whitespace."""
     base = os.path.basename(name or "doc")
-    # Keep original filename with extension as doc_id
-    return base
+    # Replace one or more whitespace characters with a single underscore
+    return re.sub(r'\s+', '_', base)
 
 def _extract_pdf_text_and_page_map(
     path: Path,
