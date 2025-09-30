@@ -1,6 +1,29 @@
 # ruff: noqa: E501
 from __future__ import annotations
 
+import subprocess
+
+# ======================= START: TEMPORARY DIAGNOSTIC CODE =======================
+import sys
+
+try:
+    # Check if the package is installed according to pip
+    subprocess.run(
+        [sys.executable, "-m", "pip", "show", "python-docx"],
+        check=True, # This will error out if the package is not found
+        capture_output=True,
+        text=True,
+    )
+    print("--- DIAGNOSTIC SUCCESS: python-docx IS installed. ---")
+except subprocess.CalledProcessError:
+    print("--- DIAGNOSTIC FAILURE: python-docx IS NOT installed. ---")
+    # If it's not found, print every package that IS installed.
+    result = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True, text=True)
+    print("--- DIAGNOSTIC: List of all installed packages on the server: ---")
+    print(result.stdout)
+    print("-------------------- END OF DIAGNOSTIC LIST --------------------")
+# ======================== END: TEMPORARY DIAGNOSTIC CODE ========================
+
 import html
 import io
 import os
