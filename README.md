@@ -4,7 +4,7 @@ A simple, evidence-level full-text search engine written in Python.
 
 ## Features
 -   **Fast, In-Memory Indexing**: Builds an inverted index for quick searching.
--   **Multiple File Types**: Supports PDF, DOCX, and TXT files.
+-   **Multiple File Types**: Supports PDF and simple TXT files.
 -   **OCR Support**: Automatically extracts text from scanned PDFs using Tesseract.
 -   **Auto Search Modes**:
     -   Ranked search (BM25)
