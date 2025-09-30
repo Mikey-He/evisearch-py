@@ -1,17 +1,13 @@
 services:
   - type: web
     name: evisearch
-    runtime: python
-    plan: standard  
+    runtime: docker
     region: oregon
-
-    buildCommand: |
-      apt-get update
-      apt-get install -y tesseract-ocr tesseract-ocr-eng
-      pip install -r requirements.txt
-    startCommand: "gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT evisearch.api:app"
-
+    plan: standard
+    
     envVars:
+      - key: PORT
+        value: 10000
       - key: BASIC_USER
         value: "" 
       - key: BASIC_PASS
