@@ -1,20 +1,17 @@
 ﻿
 # EviSearch-Py
+A simple, evidence-level full-text search engine written in Python.
 
-Evidence-level mini search engine. Returns the **original line** and **1-based line number**.  
-Supports **Boolean**, **exact phrase**, and **BM25 ranked** search. Ships with CLI, minimal REST API, and small benchmark scripts.
-
----
-
-## Requirements
-- Python 3.11+ (tested on 3.12)
-- Windows/macOS/Linux
-- Dependencies installed via `pip` (see commands below)
-
----
-
-## Install
-```bash
-# inside your project venv
-pip install -U pip
-pip install fastapi uvicorn matplotlib pytest pytest-cov mypy ruff black
+## Features
+-   **Fast, In-Memory Indexing**: Builds an inverted index for quick searching.
+-   **Multiple File Types**: Supports PDF, DOCX, and TXT files.
+-   **OCR Support**: Automatically extracts text from scanned PDFs using Tesseract.
+-   **Auto Search Modes**:
+    -   Ranked search (BM25)
+    -   Boolean search (`AND`, `OR`, `NOT`)
+    -   Exact phrase search
+-   **Rich Search Results**: Generates highlighted text snippets and page snapshot images.
+-   **Dual Interfaces**:
+    -   A modern web UI built with FastAPI.
+    -   A full-featured Command-Line Interface (CLI).
+-   **Performance Benchmarking**: Includes scripts to measure QPS, latency, and index size.
