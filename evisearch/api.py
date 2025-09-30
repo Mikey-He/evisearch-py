@@ -835,7 +835,7 @@ def ui_page() -> HTMLResponse:
       <span class="icon-sun">☀️</span>
   </button>
   <h1>EviSearch-Py</h1>
-  <div class="sub">Drop PDFs/TXT here. Files index automatically. Then search.</div>
+  <div class="sub">Drop PDFs/DOCs/TXT here. Files index automatically. Then search.</div>
 
   <div id="zone" class="zone">
     <div class="zone-content">
