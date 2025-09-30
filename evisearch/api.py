@@ -1,4 +1,5 @@
 # ruff: noqa: E501
+# ruff: noqa: E501
 from __future__ import annotations
 
 import html
@@ -41,6 +42,7 @@ _DOC_PATHS: dict[str, str] = {}
 # doc_id -> (text, page_map) for rebuilding index
 _DOC_DATA: dict[str, tuple[str, list[tuple[int, int]]]] = {}
 
+_FILENAME_TO_DOC_ID: dict[str, str] = {}
 # Default context windows
 DEFAULT_LINES_WINDOW = 1
 DEFAULT_COL_WINDOW = 1
@@ -135,10 +137,18 @@ def _terms_qs(terms: list[str]) -> str:
     return f"&terms={qs}"
 
 def _safe_doc_id(name: str) -> str:
-    """Create safe document ID from filename, replacing whitespace."""
+    """Create safe document ID from filename, replacing whitespace and special chars."""
+    import unicodedata
     base = os.path.basename(name or "doc")
-    # Replace one or more whitespace characters with a single underscore
-    return re.sub(r'\s+', '_', base)
+    # Normalize unicode characters
+    base = unicodedata.normalize('NFKD', base)
+    # Remove smart quotes and apostrophes
+    base = re.sub(r"['\u2018\u2019\u201C\u201D]", "", base)
+    # Replace whitespace with underscore
+    base = re.sub(r'\s+', '_', base)
+    # Replace other problematic characters with underscore
+    base = re.sub(r'[^\w\s\-\.]', '_', base)
+    return base
 
 def _extract_pdf_text_and_page_map(
     path: Path,
@@ -1357,6 +1367,7 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
 
         doc_id = _safe_doc_id(f.filename)
         _DOC_PATHS[doc_id] = str(dest)
+        _FILENAME_TO_DOC_ID[f.filename] = doc_id
 
         text = ""
         page_map = []
@@ -1391,7 +1402,7 @@ def list_files() -> FileListOut:
 @app.delete("/files", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
 def delete_all_files() -> DeleteOut:
     """Deletes all uploaded files and clears the index."""
-    global _INDEX
+    global _INDEX, _FILENAME_TO_DOC_ID  #  _FILENAME_TO_DOC_ID
 
     for _, path_str in _DOC_PATHS.items():
         if path_str:
@@ -1406,6 +1417,7 @@ def delete_all_files() -> DeleteOut:
     # Clear in-memory data stores
     _DOC_DATA.clear()
     _DOC_PATHS.clear()
+    _FILENAME_TO_DOC_ID.clear()  
 
     # Reset the index
     with _INDEX_LOCK:
@@ -1415,10 +1427,22 @@ def delete_all_files() -> DeleteOut:
 
 @app.delete("/files/{name}", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
 def delete_file(name: str) -> DeleteOut:
-    doc_id = _safe_doc_id(name)
+    # Try to find doc_id from original filename first
+    doc_id = _FILENAME_TO_DOC_ID.get(name)
+    if not doc_id:
+        # Fallback to sanitized version
+        doc_id = _safe_doc_id(name)
     
-    # If the doc_id does not exist, return 404
+    # Check if document exists
+    if doc_id not in _DOC_DATA:
+        raise HTTPException(404, f"Document '{name}' not found")
+    
+    # Remove from all data structures
     _DOC_DATA.pop(doc_id, None)
+    
+    # Remove from filename mapping
+    global _FILENAME_TO_DOC_ID
+    _FILENAME_TO_DOC_ID = {k: v for k, v in _FILENAME_TO_DOC_ID.items() if v != doc_id}
     
     # get the path to delete and remove from _DOC_PATHS
     path_str_to_delete = _DOC_PATHS.pop(doc_id, None)
@@ -1440,7 +1464,7 @@ def delete_file(name: str) -> DeleteOut:
             global _INDEX
             _INDEX = None
 
-    return DeleteOut(ok=True, message=f"removed {doc_id}")
+    return DeleteOut(ok=True, message=f"removed {name}")
 
 @app.post("/search", response_model=SearchOut, dependencies=[Depends(_check_auth)])
 def search_endpoint(payload: SearchIn) -> SearchOut:
@@ -1471,9 +1495,15 @@ def page_snapshot(
     scale: float = 3.0,              
 ):
     """High-DPI PNG snapshot; highlight terms and draw table boxes (yellow)."""
+    # Decode URL-encoded doc_id
+    doc_id = ul.unquote_plus(doc_id)
+    
     pdf_path = _DOC_PATHS.get(doc_id)
     if not pdf_path or not os.path.exists(pdf_path):
-        raise HTTPException(404, "file not found")
+        # Log the error for debugging
+        print(f"ERROR: Document not found. Requested doc_id: '{doc_id}'")
+        print(f"Available doc_ids: {list(_DOC_PATHS.keys())}")
+        raise HTTPException(404, f"file not found: {doc_id}")
 
     if not (1.0 <= scale <= 4.0):
         scale = 3.0
