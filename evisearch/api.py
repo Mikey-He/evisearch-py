@@ -10,6 +10,7 @@ import threading
 from typing import Annotated, Any
 import urllib.parse as ul
 
+import docx  # python-docx
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -17,6 +18,7 @@ import fitz  # PyMuPDF  # type: ignore[import-untyped]
 import pdfplumber
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
+import pytesseract
 
 from .analyzer import Analyzer
 from .indexer import IndexWriter, InvertedIndex
@@ -142,16 +144,44 @@ def _safe_doc_id(name: str) -> str:
 def _extract_pdf_text_and_page_map(
     path: Path,
 ) -> tuple[str, list[tuple[int, int]]]:
-    """Extract page texts and page_map using PyMuPDF (fitz)"""
+    """
+    Extract page texts and page_map using PyMuPDF (fitz).
+    Fallback to OCR for scanned PDFs.
+    """
     texts: list[str] = []
     page_map: list[tuple[int, int]] = []
     pos = 0
 
-    with fitz.open(str(path)) as doc: # fitz
-        for i, page in enumerate(doc, start=1):
-            # Extract text with fallback to empty string
-            txt = page.get_text() or "" 
-            texts.append(txt)
+    # OCR threshold: if average chars per page is below this, do OCR
+    OCR_THRESHOLD_CHARS_PER_PAGE = 100 
+
+    with fitz.open(str(path)) as doc:
+        # try to extract text normally
+        plain_texts = [page.get_text() or "" for page in doc]
+        total_chars = sum(len(t) for t in plain_texts)
+
+        # Decide if OCR is needed
+        if total_chars < len(doc) * OCR_THRESHOLD_CHARS_PER_PAGE and len(doc) > 0:
+            print(f"INFO: Low text content for {path.name}. Attempting OCR...")
+            # OCR Fallback
+            for i, page in enumerate(doc, start=1):
+                # Render page to image
+                pix = page.get_pixmap(dpi=300) 
+                img_data = pix.tobytes("png")
+                img = Image.open(io.BytesIO(img_data))
+
+                # Perform OCR
+                try:
+                    txt = pytesseract.image_to_string(img, lang='eng') 
+                except Exception as e:
+                    print(f"WARN: OCR failed for page {i} of {path.name}: {e}")
+                    txt = "" 
+                texts.append(txt)
+        else:
+            texts = plain_texts
+
+        # Build page map
+        for i, txt in enumerate(texts, start=1):
             toks = list(_ANALYZER.iter_tokens(txt, keep_stopwords=True))
             page_map.append((pos, i))
             pos += len(toks)
@@ -994,23 +1024,45 @@ function xhrUpload(file, row, fileId) {
         const xhr = new XMLHttpRequest();
         activeXHRs.set(fileId, xhr);
         xhr.open('POST', '/index-files');
+        
+        // Progress event handler
         xhr.upload.onprogress = e => {
             if (e.lengthComputable) {
                 const p = Math.round((e.loaded / e.total) * 100);
                 row.querySelector('progress').value = p;
-                row.querySelector('span').textContent = `uploading ${p}%`;
+                const statusSpan = row.querySelector('span');
+
+                if (p < 100) {
+                    statusSpan.textContent = `uploading ${p}%`;
+                } else {
+                    // p is 100%
+                    statusSpan.textContent = `Processing (OCR may take a moment)...`;
+                }
             }
         };
+
         xhr.onload = () => {
             activeXHRs.delete(fileId);
             if (xhr.status >= 200 && xhr.status < 300) {
                 row.querySelector('progress').value = 100;
+                // after upload completes, show "indexed"
                 row.querySelector('span').textContent = 'indexed';
                 resolve();
-            } else { reject(new Error('Upload failed')); }
+            } else { 
+                row.querySelector('span').textContent = 'error'; // add error status
+                reject(new Error('Upload failed')); 
+            }
         };
-        xhr.onerror = () => { activeXHRs.delete(fileId); reject(new Error('Network error')); };
-        xhr.onabort = () => { activeXHRs.delete(fileId); reject(new Error('Aborted')); };
+        xhr.onerror = () => { 
+            activeXHRs.delete(fileId); 
+            row.querySelector('span').textContent = 'error'; // same as above
+            reject(new Error('Network error')); 
+        };
+        xhr.onabort = () => { 
+            activeXHRs.delete(fileId); 
+            // Show cancelled status
+            reject(new Error('Aborted')); 
+        };
         xhr.send(fd);
     });
 }
@@ -1062,16 +1114,19 @@ async function doSearch() {
       ? `<span class="badge">${rdoc.hits.length} of ${rdoc.total_hits} hits</span>`
       : '';
     
-    const showAllLink = rdoc.has_more
-      // Pass the query value to showAllHits
-      ? `<span class="show-all" onclick="showAllHits('${rdoc.doc_id}', '${q.value.replace(/'/g, "\\'")}')">Show all hits</span>`
+    const toggleLink = rdoc.has_more
+      ? `<span class="toggle-hits-link show-all" style="cursor:pointer; color:var(--accent); text-decoration:underline; font-size:14px; margin-left:10px;" 
+            onclick="updateDocHits('${rdoc.doc_id}', '${q.value.replace(/'/g, "\\'")}', true)">Show all hits</span>`
       : '';
     
     const hitHtml = createHitHtml(rdoc.hits);
     
     out.push(
       `<div class="card" data-doc-id="${rdoc.doc_id}">
-        <div class="doc">${rdoc.doc_id} ${sc} ${ht} ${showAllLink}</div>
+        <div class="doc">
+            ${rdoc.doc_id} ${sc} ${ht}
+            <span class="toggle-link-container">${toggleLink}</span>
+        </div>
         <div class="hit-container">
           ${hitHtml}
         </div>
@@ -1083,22 +1138,21 @@ async function doSearch() {
 }
 
 // showAllHits 
-async function showAllHits(docId, currentQuery) {
-  // Find the card element to update
+async function updateDocHits(docId, currentQuery, fetchAll) {
   const card = document.querySelector(`.card[data-doc-id='${docId}']`);
   if (!card) return;
   
   const hitContainer = card.querySelector('.hit-container');
-  const showAllLink = card.querySelector('.show-all');
-  const hitBadge = card.querySelector('.doc .badge:nth-child(2)'); // Total hits badge
+  const linkContainer = card.querySelector('.toggle-link-container');
+  const hitBadge = card.querySelector('.doc .badge:nth-child(2)');
 
-  if (hitContainer) hitContainer.innerHTML = '<div class="muted" style="margin-left:10px;">Loading all hits...</div>';
-  if (showAllLink) showAllLink.style.display = 'none';
+  if (hitContainer) hitContainer.innerHTML = '<div class="muted" style="margin-left:10px;">Loading...</div>';
+  if (linkContainer) linkContainer.innerHTML = ''; // Clear link while loading
 
   const payload = {
-    q: currentQuery, // Use the query passed from doSearch
-    doc_id: docId, // Crucial: filter to this specific document
-    max_hits_per_doc: MAX_HITS_ALL, // Request the maximum number of hits (50)
+    q: currentQuery,
+    doc_id: docId,
+    max_hits_per_doc: fetchAll ? MAX_HITS_ALL : 5, // fetch all or default
     context_lines: 2
   };
   
@@ -1111,22 +1165,35 @@ async function showAllHits(docId, currentQuery) {
     });
     jsonResponse = await r.json();
   } catch (e) {
-    if (hitContainer) hitContainer.innerHTML = '<div class="muted" style="margin-left:10px;">Error loading all hits.</div>';
-    console.error(`Failed to load all hits for ${docId}:`, e);
+    if (hitContainer) hitContainer.innerHTML = '<div class="muted" style="margin-left:10px;">Error loading hits.</div>';
+    console.error(`Failed to load hits for ${docId}:`, e);
     return;
   }
   
   const rdoc = jsonResponse.results[0];
   if (!rdoc) return;
   
-  // 1. Update the hit container with ALL hits
+  // 1. hits HTML
   if (hitContainer) {
       hitContainer.innerHTML = createHitHtml(rdoc.hits);
   }
 
-  // 2. Update the total hits badge
+  // 2. hits badge update
   if (hitBadge) {
-      hitBadge.textContent = `${rdoc.total_hits} of ${rdoc.total_hits} hits`;
+      hitBadge.textContent = `${rdoc.hits.length} of ${rdoc.total_hits} hits`;
+  }
+
+  // 3. toggle link update
+  if (linkContainer) {
+    let newLink = '';
+    if (fetchAll && rdoc.total_hits > 5) { // If currently showing all hits and there are more than default
+        newLink = `<span class="toggle-hits-link collapse" style="cursor:pointer; color:var(--accent); text-decoration:underline; font-size:14px; margin-left:10px;" 
+                        onclick="updateDocHits('${docId}', '${currentQuery.replace(/'/g, "\\'")}', false)">Collapse</span>`;
+    } else if (!fetchAll && rdoc.has_more) { // If currently showing default hits and there are more
+        newLink = `<span class="toggle-hits-link show-all" style="cursor:pointer; color:var(--accent); text-decoration:underline; font-size:14px; margin-left:10px;" 
+                        onclick="updateDocHits('${docId}', '${currentQuery.replace(/'/g, "\\'")}', true)">Show all hits</span>`;
+    }
+    linkContainer.innerHTML = newLink;
   }
 }
 
@@ -1252,6 +1319,7 @@ def _rebuild_index_from_docs() -> None:
         writer.add(did, text, page_map=page_map)
     _INDEX = writer.commit()
 
+
 @app.post("/index-files", response_model=IndexOut, dependencies=[Depends(_check_auth)])
 async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: B008
     if not files:
@@ -1266,18 +1334,35 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
         doc_id = _safe_doc_id(f.filename)
         _DOC_PATHS[doc_id] = str(dest)
 
-        if f.filename.lower().endswith(".pdf"):
+        text = ""
+        page_map = []
+
+        file_ext = f.filename.lower().split('.')[-1]
+
+        if file_ext == "pdf":
             try:
                 text, page_map = _extract_pdf_text_and_page_map(dest)
             except Exception as e:
-                # Add logging for PDF extraction failure
                 print(f"Error extracting PDF text for {f.filename}: {e}")
-                # Clean up the partially processed file/data if needed
                 if dest.exists():
                     dest.unlink()
                 _DOC_PATHS.pop(doc_id, None)
-                continue # Skip this file and proceed to the next one
-        else:
+                continue
+        elif file_ext == "docx":
+            try:
+                # python-docx
+                doc = docx.Document(dest)
+                full_text = [p.text for p in doc.paragraphs]
+                text = "\n".join(full_text)
+                # DOCX has no inherent page structure
+                page_map = []
+            except Exception as e:
+                print(f"Error extracting DOCX text for {f.filename}: {e}")
+                if dest.exists():
+                    dest.unlink()
+                _DOC_PATHS.pop(doc_id, None)
+                continue
+        else: # Assume plain text
             text = dest.read_text(encoding="utf-8", errors="ignore")
             page_map = []
 
