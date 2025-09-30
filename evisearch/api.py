@@ -1372,23 +1372,24 @@ def list_files() -> FileListOut:
 def delete_all_files() -> DeleteOut:
     """Deletes all uploaded files and clears the index."""
     global _INDEX
-    doc_ids_to_delete = list(_DOC_DATA.keys())
 
-    # Delete physical files
-    for doc_id in doc_ids_to_delete:
-        p = UPLOAD_DIR / doc_id
-        if p.exists():
-            try:
-                p.unlink()
-            except Exception:
-                # Log or ignore errors if a file is locked, etc.
-                pass
+    # Delete physical files using the correct paths from the map
+    # Use '_' for the unused doc_id variable
+    for _, path_str in _DOC_PATHS.items():
+        if path_str:
+            p = Path(path_str)
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception as e:
+                    # Log or ignore errors if a file is locked, etc.
+                    print(f"WARN: Could not delete file {p}: {e}")
 
     # Clear in-memory data stores
     _DOC_DATA.clear()
     _DOC_PATHS.clear()
 
-    # Reset the index
+    # Reset the Index
     with _INDEX_LOCK:
         _INDEX = None
 
@@ -1397,20 +1398,27 @@ def delete_all_files() -> DeleteOut:
 @app.delete("/files/{name}", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
 def delete_file(name: str) -> DeleteOut:
     doc_id = _safe_doc_id(name)
+    
+    # Correctly get the path BEFORE removing the record
+    path_to_delete_str = _DOC_PATHS.get(doc_id)
+
+    # Pop records from memory
     _DOC_DATA.pop(doc_id, None)
     _DOC_PATHS.pop(doc_id, None)
-    p = UPLOAD_DIR / doc_id
-    if p.exists():
-        try:
-            p.unlink()
-        except Exception:
-            pass
+
+    # Delete the actual file using the retrieved path
+    if path_to_delete_str:
+        p = Path(path_to_delete_str)
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception as e:
+                print(f"WARN: Could not delete file {p}: {e}")
 
     with _INDEX_LOCK:
         if _DOC_DATA:
             _rebuild_index_from_docs()
         else:
-
             global _INDEX
             _INDEX = None
 
