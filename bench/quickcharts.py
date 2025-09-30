@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # type: ignore
 
 from bench.benchmark import (
     approx_index_size_bytes,
@@ -17,9 +17,6 @@ from bench.benchmark import (
 from evisearch.searcher import Searcher
 
 
-# ----------------------------
-# Optional: Precision@10 evaluator
-# ----------------------------
 def load_gold_jsonl(path: Path) -> list[tuple[str, set[str]]]:
     """
     Read a JSONL file where each line looks like:
@@ -62,9 +59,7 @@ def precision_at_10(
     return total / float(len(gold))
 
 
-# ----------------------------
 # Plot helpers
-# ----------------------------
 def plot_qps_p95(
     stats_ranked: dict[str, float],
     stats_boolean: dict[str, float],
@@ -121,10 +116,8 @@ def maybe_plot_precision_at_10(
     fig.tight_layout()
     fig.savefig(out, dpi=150)
 
-
-# ----------------------------
 # CLI
-# ----------------------------
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run EviSearch bench and plot charts")
     parser.add_argument("--docs", default="data/docs", help="Directory with .txt files")

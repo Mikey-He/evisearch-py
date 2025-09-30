@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from pathlib import Path
 import random
 import statistics
 import time
-from collections import Counter
-from pathlib import Path
 
 from evisearch.analyzer import Analyzer
 from evisearch.indexer import IndexWriter, InvertedIndex
