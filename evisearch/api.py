@@ -1,4 +1,5 @@
 # ruff: noqa: E501
+# ruff: noqa: E501
 from __future__ import annotations
 
 import html
@@ -10,6 +11,7 @@ import threading
 from typing import Annotated, Any
 import urllib.parse as ul
 
+import docx  # python-docx
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -137,7 +139,7 @@ def _terms_qs(terms: list[str]) -> str:
 def _safe_doc_id(name: str) -> str:
     """Create safe document ID from filename, replacing whitespace."""
     base = os.path.basename(name or "doc")
-    # Replace one or more whitespace characters with a single underscore
+# Replace one or more whitespace characters with a single underscore
     return re.sub(r'\s+', '_', base)
 
 def _extract_pdf_text_and_page_map(
@@ -688,7 +690,7 @@ def ui_page() -> HTMLResponse:
         height: 24px;
         fill: currentColor;
     }
-               
+                        
     .zone {
       border: 2px dashed var(--border);
       border-radius: 12px;
@@ -835,7 +837,7 @@ def ui_page() -> HTMLResponse:
   </button>
   <a href="https://github.com/Mikey-He/evisearch-py" class="github-link" target="_blank" rel="noopener noreferrer" title="View on GitHub">
     <svg viewBox="0 0 16 16" version="1.1" aria-hidden="true"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.67.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
-  </a>                      
+  </a>                                            
   <h1>EviSearch-Py</h1>
   <div class="sub">Drop PDFs here. Files index automatically. Then search.</div>
 
@@ -847,7 +849,7 @@ def ui_page() -> HTMLResponse:
     </div>
     <div id="state" class="muted">docs: 0, vocab: 0</div>
   </div>
-  <div id="files" class="list"></div>          
+  <div id="files" class="list"></div>
 
   <div id="deleteAllContainer" style="text-align: right; margin: 10px 0; display: none;">
       <button class="btn danger" id="deleteAllBtn">Delete All Files</button>
@@ -1351,12 +1353,6 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
 
     added = 0
     for f in files:
-        # --- 开始替换的部分 ---
-        file_ext = (f.filename or "").lower().split('.')[-1]
-        if file_ext != "pdf":
-            print(f"INFO: Skipping non-PDF file: {f.filename}")
-            continue
-
         dest = UPLOAD_DIR / f.filename
         with dest.open("wb") as w:
             w.write(await f.read())
@@ -1364,15 +1360,38 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
         doc_id = _safe_doc_id(f.filename)
         _DOC_PATHS[doc_id] = str(dest)
 
-        try:
-            text, page_map = _extract_pdf_text_and_page_map(dest)
-        except Exception as e:
-            print(f"Error extracting PDF text for {f.filename}: {e}")
-            if dest.exists():
-                dest.unlink()
-            _DOC_PATHS.pop(doc_id, None)
-            continue
-        
+        text = ""
+        page_map = []
+
+        file_ext = f.filename.lower().split('.')[-1]
+
+        if file_ext == "pdf":
+            try:
+                text, page_map = _extract_pdf_text_and_page_map(dest)
+            except Exception as e:
+                print(f"Error extracting PDF text for {f.filename}: {e}")
+                if dest.exists():
+                    dest.unlink()
+                _DOC_PATHS.pop(doc_id, None)
+                continue
+        elif file_ext == "docx":
+            try:
+                # python-docx
+                doc = docx.Document(dest)
+                full_text = [p.text for p in doc.paragraphs]
+                text = "\n".join(full_text)
+                # DOCX has no inherent page structure
+                page_map = []
+            except Exception as e:
+                print(f"Error extracting DOCX text for {f.filename}: {e}")
+                if dest.exists():
+                    dest.unlink()
+                _DOC_PATHS.pop(doc_id, None)
+                continue
+        else: # Assume plain text
+            text = dest.read_text(encoding="utf-8", errors="ignore")
+            page_map = []
+
         _DOC_DATA[doc_id] = (text, page_map)
         added += 1
 
@@ -1415,20 +1434,19 @@ def delete_all_files() -> DeleteOut:
 def delete_file(name: str) -> DeleteOut:
     doc_id = _safe_doc_id(name)
     _DOC_DATA.pop(doc_id, None)
-    
-    path_str = _DOC_PATHS.pop(doc_id, None)
-    if path_str:
-        p = Path(path_str)
-        if p.exists():
-            try:
-                p.unlink()
-            except Exception:
-                pass
+    _DOC_PATHS.pop(doc_id, None)
+    p = UPLOAD_DIR / doc_id
+    if p.exists():
+        try:
+            p.unlink()
+        except Exception:
+            pass
 
     with _INDEX_LOCK:
         if _DOC_DATA:
             _rebuild_index_from_docs()
         else:
+
             global _INDEX
             _INDEX = None
 
