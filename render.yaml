@@ -14,5 +14,3 @@ services:
         value: "" 
       - key: BASIC_PASS
         value: ""
-      - key: NATIVE_PACKAGES
-        value: "tesseract-ocr tesseract-ocr-eng"
