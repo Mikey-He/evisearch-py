@@ -6,10 +6,14 @@ services:
     region: oregon
 
     buildCommand: |
+      echo "--- DIAGNOSTIC STEP 1: Build command has started ---"
       apt-get update
       apt-get install -y tesseract-ocr tesseract-ocr-eng
+      echo "--- DIAGNOSTIC STEP 2: apt-get finished. Checking for tesseract binary... ---"
+      ls -l /usr/bin/tesseract
+      echo "--- DIAGNOSTIC STEP 3: Pip install starting... ---"
       pip install -r requirements.txt
-
+      echo "--- DIAGNOSTIC STEP 4: Build command finished ---"
     startCommand: "gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT evisearch.api:app"
 
     envVars:
