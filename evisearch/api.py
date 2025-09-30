@@ -6,11 +6,11 @@ import io
 import os
 from pathlib import Path
 import re
+import subprocess
 import threading
 from typing import Annotated, Any
 import urllib.parse as ul
 
-import docx  # python-docx
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -1095,26 +1095,14 @@ function xhrUpload(file, row, fileId) {
 // Helper to convert hits data to HTML
 function createHitHtml(hits) {
     return hits.map((h, idx) => {
-        let content = '';
-        
-        // Prefer snapshot if available
-        if (h.snapshot_url) {
-            content = `<img src="${h.snapshot_url}" onclick="openLightbox(this.src)" alt="Page snapshot"/>`;
-        } 
-        // secondary fallback to snippet_html
-        else if (h.snippet_html) {
-            content = h.snippet_html;
-        }
-
-        // Only return if there's content to show
-        if (content) {
-            return `<div class="hit">
-                <div class="meta">Hit ${idx + 1}${h.page ? ` - Page ${h.page}` : ''}</div>
-                ${content}
-            </div>`;
-        }
-        
-        return ''; // Return nothing if there's neither a snapshot nor a snippet
+      // Only show images, no text/table snippets in the UI
+      if (h.snapshot_url) {
+        return `<div class="hit">
+          <div class="meta">Hit ${idx + 1}${h.page ? ` - Page ${h.page}` : ''}</div>
+          <img src="${h.snapshot_url}" onclick="openLightbox(this.src)" alt="Page snapshot"/>
+        </div>`;
+      }
+      return '';
     }).join('');
 }
                         
@@ -1387,14 +1375,37 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
                 continue
         elif file_ext == "docx":
             try:
-                # python-docx
-                doc = docx.Document(dest)
-                full_text = [p.text for p in doc.paragraphs]
-                text = "\n".join(full_text)
-                # DOCX has no inherent page structure
-                page_map = []
-            except Exception as e:
-                print(f"Error extracting DOCX text for {f.filename}: {e}")
+                # use libreoffice to convert to PDF first
+                print(f"INFO: Converting {f.filename} to PDF using LibreOffice...")
+                subprocess.run(
+                    [
+                        "libreoffice",
+                        "--headless",
+                        "--convert-to",
+                        "pdf",
+                        "--outdir",
+                        str(UPLOAD_DIR),
+                        str(dest),
+                    ],
+                    check=True,
+                    timeout=180, 
+                )
+                print(f"INFO: Conversion successful for {f.filename}.")
+
+                # make sure the PDF was created
+                pdf_path = dest.with_suffix(".pdf")
+                if not pdf_path.exists():
+                    raise FileNotFoundError("PDF conversion failed, output file not found.")
+                
+                # Update the document path to point to the new PDF file
+                _DOC_PATHS[doc_id] = str(pdf_path)
+
+                # extract text from the new PDF
+                text, page_map = _extract_pdf_text_and_page_map(pdf_path)
+
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+                print(f"ERROR: Failed to convert or process DOCX {f.filename}: {e}")
+                # if conversion or processing fails, clean up both DOCX and any partial PDF
                 if dest.exists():
                     dest.unlink()
                 _DOC_PATHS.pop(doc_id, None)
@@ -1444,20 +1455,37 @@ def delete_all_files() -> DeleteOut:
 @app.delete("/files/{name}", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
 def delete_file(name: str) -> DeleteOut:
     doc_id = _safe_doc_id(name)
+    
+    # If the doc_id does not exist, return 404
     _DOC_DATA.pop(doc_id, None)
-    _DOC_PATHS.pop(doc_id, None)
-    p = UPLOAD_DIR / doc_id
-    if p.exists():
-        try:
-            p.unlink()
-        except Exception:
-            pass
+    
+    # get the path to delete and remove from _DOC_PATHS
+    path_str_to_delete = _DOC_PATHS.pop(doc_id, None)
+
+    if path_str_to_delete:
+        path_to_delete = Path(path_str_to_delete)
+        
+        # logic to also delete associated .docx if the main file is a .pdf
+        if path_to_delete.suffix.lower() == ".pdf":
+            docx_equivalent = path_to_delete.with_suffix(".docx")
+            if docx_equivalent.exists():
+                try:
+                    docx_equivalent.unlink()
+                    print(f"INFO: Deleted associated DOCX: {docx_equivalent.name}")
+                except Exception as e:
+                    print(f"WARN: Could not delete associated DOCX {docx_equivalent.name}: {e}")
+        
+        # delete the main file
+        if path_to_delete.exists():
+            try:
+                path_to_delete.unlink()
+            except Exception as e:
+                print(f"WARN: Could not delete file {path_to_delete.name}: {e}")
 
     with _INDEX_LOCK:
         if _DOC_DATA:
             _rebuild_index_from_docs()
         else:
-
             global _INDEX
             _INDEX = None
 
