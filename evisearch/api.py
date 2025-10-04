@@ -169,7 +169,7 @@ def _extract_pdf_text_and_page_map(
             # OCR Fallback
             for i, page in enumerate(doc, start=1):
                 # Render page to image
-                pix = page.get_pixmap(dpi=300) 
+                pix = page.get_pixmap(dpi=200) 
                 img_data = pix.tobytes("png")
                 img = Image.open(io.BytesIO(img_data))
 
