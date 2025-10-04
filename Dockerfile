@@ -8,9 +8,8 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["gunicorn", "api:app", "--bind", "0.0.0.0:10000", "--timeout", "300", "--workers", "2", "--worker-class", "uvicorn.workers.UvicornWorker"]
+CMD ["gunicorn", "evisearch.api:app", "--bind", "0.0.0.0:10000", "--timeout", "300", "--workers", "2", "--worker-class", "uvicorn.workers.UvicornWorker"]
