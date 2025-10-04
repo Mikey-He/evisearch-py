@@ -156,7 +156,7 @@ def _extract_pdf_text_and_page_map(
     pos = 0
 
     # OCR threshold: if average chars per page is below this, do OCR
-    OCR_THRESHOLD_CHARS_PER_PAGE = 100 
+    OCR_THRESHOLD_CHARS_PER_PAGE = 50 
 
     with fitz.open(str(path)) as doc:
         # try to extract text normally
@@ -175,7 +175,7 @@ def _extract_pdf_text_and_page_map(
 
                 # Perform OCR
                 try:
-                    txt = pytesseract.image_to_string(img, lang='eng') 
+                    txt = pytesseract.image_to_string(img, lang='eng', timeout= 60) 
                 except Exception as e:
                     print(f"WARN: OCR failed for page {i} of {path.name}: {e}")
                     txt = "" 
