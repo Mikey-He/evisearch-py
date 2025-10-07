@@ -139,7 +139,7 @@ def _terms_qs(terms: list[str]) -> str:
 def _safe_doc_id(name: str) -> str:
     """Create safe document ID from filename."""
     base = os.path.basename(name or "doc")
-    # Don't modify the filename - just use it as-is
+    base = re.sub(r'\s+', '_', base)
     # Only replace truly problematic characters that might cause file system issues
     base = base.replace('/', '_').replace('\\', '_').replace('\0', '_')
     return base
@@ -438,7 +438,7 @@ def _perform_search(
                     # Only add snapshot if not already shown for this page
                     if page not in shown_pages.get(doc_id, set()):
                         table.snapshot_url = (
-                            f"/page-snapshot?doc_id={doc_id}"
+                            f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
                             f"&page={table.page}"
                             f"&full=1"
                             f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
@@ -452,7 +452,7 @@ def _perform_search(
                     # Generate page snapshot if not already shown
                     if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
-                            f"/page-snapshot?doc_id={doc_id}"
+                            f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
                             f"&page={page}"
                             f"&full=1"
                             f"{_terms_qs(terms)}&scale=2"
@@ -487,7 +487,7 @@ def _perform_search(
                 if table:
                     if page not in shown_pages.get(doc_id, set()):
                         table.snapshot_url = (
-                            f"/page-snapshot?doc_id={doc_id}"
+                            f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
                             f"&page={table.page}"
                             f"&full=1"
                             f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
@@ -499,7 +499,7 @@ def _perform_search(
                     snippet = _paragraph_snippet(doc_id, pos, terms, context_lines)
                     if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
-                            f"/page-snapshot?doc_id={doc_id}"
+                            f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
                             f"&page={page}"
                             f"&full=1"
                             f"{_terms_qs(terms)}&scale=2"
@@ -534,7 +534,7 @@ def _perform_search(
                 if table:
                     if page not in shown_pages.get(doc_id, set()):
                         table.snapshot_url = (
-                            f"/page-snapshot?doc_id={doc_id}"
+                            f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
                             f"&page={table.page}"
                             f"&full=1"
                             f"&boxes={table.bbox[0]},{table.bbox[1]},{table.bbox[2]},{table.bbox[3]}"
@@ -546,7 +546,7 @@ def _perform_search(
                     snippet = _paragraph_snippet(doc_id, pos, terms, context_lines)
                     if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
-                            f"/page-snapshot?doc_id={doc_id}"
+                            f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
                             f"&page={page}"
                             f"&full=1"
                             f"{_terms_qs(terms)}&scale=2"
@@ -1391,7 +1391,15 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
 
 @app.get("/files", response_model=FileListOut, dependencies=[Depends(_check_auth)])
 def list_files() -> FileListOut:
-    return FileListOut(files=sorted(_DOC_DATA.keys()))
+    # Get original filenames from the mapping
+    original_names = list(_FILENAME_TO_DOC_ID.keys())
+    
+    # Fallback: if doc_id doesn't have a mapping, use doc_id itself
+    for doc_id in _DOC_DATA.keys():
+        if doc_id not in _FILENAME_TO_DOC_ID.values():
+            original_names.append(doc_id)
+    
+    return FileListOut(files=sorted(set(original_names)))
 
 @app.delete("/files", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
 def delete_all_files() -> DeleteOut:
@@ -1420,18 +1428,21 @@ def delete_all_files() -> DeleteOut:
     return DeleteOut(ok=True, message="All files removed and index cleared.")
 
 @app.delete("/files/{name}", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
-def delete_file(name: str) -> DeleteOut:
-    global _INDEX, _FILENAME_TO_DOC_ID 
+def delete_file(name: str) -> DeleteOut: 
+    global _INDEX, _FILENAME_TO_DOC_ID
+
+    # Decode URL-encoded name
+    decoded_name = ul.unquote_plus(name)
     
     # Try to find doc_id from original filename first
-    doc_id = _FILENAME_TO_DOC_ID.get(name)
+    doc_id = _FILENAME_TO_DOC_ID.get(decoded_name)
     if not doc_id:
         # Fallback to sanitized version
-        doc_id = _safe_doc_id(name)
+        doc_id = _safe_doc_id(decoded_name)
     
     # Check if document exists
     if doc_id not in _DOC_DATA:
-        raise HTTPException(404, f"Document '{name}' not found")
+        raise HTTPException(404, f"Document '{decoded_name}' not found")
     
     # Remove from all data structures
     _DOC_DATA.pop(doc_id, None)
@@ -1490,11 +1501,20 @@ def page_snapshot(
 ):
     """High-DPI PNG snapshot; highlight terms and draw table boxes (yellow)."""
     # Decode URL-encoded doc_id
-    doc_id = ul.unquote_plus(doc_id)
+    decoded_doc_id = ul.unquote_plus(doc_id)
     
-    pdf_path = _DOC_PATHS.get(doc_id)
+    # Try to find with decoded version first
+    pdf_path = _DOC_PATHS.get(decoded_doc_id)
+    
+    # If not found, try with sanitized version (in case spaces were converted to underscores)
+    if not pdf_path:
+        sanitized_doc_id = _safe_doc_id(decoded_doc_id)
+        pdf_path = _DOC_PATHS.get(sanitized_doc_id)
+        doc_id = sanitized_doc_id  # Update doc_id for error message
+    else:
+        doc_id = decoded_doc_id
+    
     if not pdf_path or not os.path.exists(pdf_path):
-        # Log the error for debugging
         print(f"ERROR: Document not found. Requested doc_id: '{doc_id}'")
         print(f"Available doc_ids: {list(_DOC_PATHS.keys())}")
         raise HTTPException(404, f"file not found: {doc_id}")
