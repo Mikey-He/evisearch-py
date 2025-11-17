@@ -1,0 +1,17 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pdfplumber>=0.10.0
+PyMuPDF>=1.23.0
+Pillow>=10.0.0
+pydantic>=2.0.0
+python-multipart>=0.0.6
+
+[dev]
+pytest>=7.4.0
+pytest-cov>=4.1.0
+mypy>=1.5.0
+ruff>=0.1.0
+black>=23.0.0
+pytesseract>=0.3.10
+celery>=5.0.0
+redis>=4.0.0

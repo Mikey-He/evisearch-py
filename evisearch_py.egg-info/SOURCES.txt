@@ -11,6 +11,7 @@ evisearch/storage.py
 evisearch_py.egg-info/PKG-INFO
 evisearch_py.egg-info/SOURCES.txt
 evisearch_py.egg-info/dependency_links.txt
+evisearch_py.egg-info/requires.txt
 evisearch_py.egg-info/top_level.txt
 tests/test_analyzer.py
 tests/test_highlight.py
