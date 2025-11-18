@@ -435,7 +435,7 @@ def _perform_search(
             for st in hits_to_show:
                 page = _page_of_pos(index, doc_id, st) or 1
                 
-                table = _table_snippet(doc_id, page - 1, terms)
+                table = None #_table_snippet(doc_id, page - 1, terms)
                 if table:
                     if page not in shown_pages.get(doc_id, set()):
                         table.snapshot_url = (
@@ -482,7 +482,7 @@ def _perform_search(
             for pos in positions_to_show:
                 page = _page_of_pos(index, doc_id, pos) or 1
                 
-                table = _table_snippet(doc_id, page - 1, terms)
+                table = None #_table_snippet(doc_id, page - 1, terms)
                 if table:
                     if page not in shown_pages.get(doc_id, set()):
                         table.snapshot_url = (
@@ -529,7 +529,7 @@ def _perform_search(
             for pos in positions_to_show:
                 page = _page_of_pos(index, doc_id, pos) or 1
                 
-                table = _table_snippet(doc_id, page - 1, terms)
+                table = None #_table_snippet(doc_id, page - 1, terms)
                 if table:
                     if page not in shown_pages.get(doc_id, set()):
                         table.snapshot_url = (
