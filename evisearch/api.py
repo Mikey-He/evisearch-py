@@ -89,13 +89,23 @@ def _needs_auth() -> bool:
     return bool(basic_user and basic_pass)
 
 def _check_auth(
-    credentials: HTTPBasicCredentials = Depends(security)  # noqa: B008
+    # --- 修改 1: 添加 | None 并设置 auto_error=False ---
+    credentials: HTTPBasicCredentials | None = Depends(security, auto_error=False)
 ) -> None:
+    # --- 修改 2: 检查 _needs_auth() 仍然是第一位 ---
     if not _needs_auth():
+        # 认证被禁用了，直接通过
         return
+
+    # --- 修改 3: 如果认证已启用，但未提供凭据，则报错 ---
+    if credentials is None:
+        # 认证已启用，但 tasks.py (或用户) 没有提供密码
+        raise HTTPException(status_code=401, detail="Credentials are required")
+
+    # --- 修改 4: 凭据已提供，检查它们是否正确 ---
     ok = credentials.username == basic_user and credentials.password == basic_pass
     if not ok:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
 
 # --- 模型 (保持不变) ---
