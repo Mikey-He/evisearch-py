@@ -43,14 +43,42 @@ DEFAULT_COL_WINDOW = 1
 MAX_HITS_DEFAULT = 3
 MAX_HITS_ALL = 50
 
-# --- 全局状态变量 (已全部移除) ---
-# _ANALYZER = Analyzer()                 <- 已移除
-# _INDEX_LOCK = threading.Lock()           <- 已移除 (移至 tasks.py)
-# _INDEX: InvertedIndex | None = None      <- 已移除
-# _DOC_PATHS: dict[str, str] = {}         <- 已移除
-# _DOC_DATA: dict[str, tuple[str, ...]] = {} <- 已移除
-# _FILENAME_TO_DOC_ID: dict[str, str] = {} <- 已移除 (将简化)
+# --- 帮助函数 (重构为无状态) ---
+# (get_analyzer_instance 和 get_index_instance 移到缓存之前)
+
+def get_analyzer_instance() -> Analyzer:
+    """按需创建分析器实例 (非常快)"""
+    return Analyzer()
+
+
+def get_index_instance() -> InvertedIndex:
+    """
+    *** 3. 关键的加载函数 ***
+    在需要时（启动时或重载时）从磁盘加载索引。
+    """
+    if not INDEX_FILE.exists():
+        # 如果文件不存在，返回一个空的索引
+        print("WARN: [API] index.json not found. Returning empty index.")
+        return InvertedIndex(postings={}, doc_lengths={}, doc_ids=[], doc_lines={}, line_of_pos={})
+    try:
+        # 从 storage.py 加载
+        print("INFO: [API] 正在从磁盘加载索引...")
+        idx = load_index(INDEX_FILE)
+        print(f"INFO: [API] 索引加载完毕。词汇量: {idx.vocabulary_size()}")
+        return idx
+    except Exception as e:
+        print(f"ERROR: [API] Failed to load index file {INDEX_FILE}: {e}")
+        # 返回一个空的，以防文件损坏
+        return InvertedIndex(postings={}, doc_lengths={}, doc_ids=[], doc_lines={}, line_of_pos={})
+
+
+# --- 全局索引缓存 (关键修复) ---
+print("INFO: [API] 正在加载初始索引到内存...")
+_ANALYZER_CACHE = get_analyzer_instance()
+_INDEX_CACHE: InvertedIndex = get_index_instance() # <-- 在启动时调用一次
+print(f"INFO: [API] 初始索引加载完毕。词汇量: {_INDEX_CACHE.vocabulary_size()}")
 # -------------------------------------
+
 
 # 基础认证 (保持不变)
 basic_user = os.getenv("BASIC_USER") or ""
@@ -71,10 +99,6 @@ def _check_auth(
 
 
 # --- 模型 (保持不变) ---
-# (保留 DocIn, IndexIn, IndexOut, SearchIn, HitData, 
-#  ResultDoc, SearchOut, DeleteOut, FileListOut 的所有 Pydantic 模型)
-# (为了简洁，这里省略了它们...
-#  请确保你保留了 api.py 中所有的 Pydantic "class" 定义)
 class DocIn(BaseModel):
     id: str
     text: str
@@ -85,8 +109,8 @@ class IndexIn(BaseModel):
 
 class IndexOut(BaseModel):
     ok: bool
-    indexed: int  # 将报告已接收的文件数
-    vocab: int    # 将报告磁盘上当前的词汇量
+    indexed: int
+    vocab: int
 
 class SearchIn(BaseModel):
     q: str
@@ -123,39 +147,12 @@ class FileListOut(BaseModel):
 # --- 模型结束 ---
 
 
-# --- 帮助函数 (重构为无状态) ---
-
-def get_analyzer_instance() -> Analyzer:
-    """按需创建分析器实例 (非常快)"""
-    return Analyzer()
-
-
-def get_index_instance() -> InvertedIndex:
-    """
-    *** 3. 关键的无状态函数 ***
-    在需要时从磁盘加载索引。
-    这使得 API 可以即时获取 worker 重建的最新索引。
-    """
-    if not INDEX_FILE.exists():
-        # 如果文件不存在，返回一个空的索引
-        print("WARN: [API] index.json not found. Returning empty index.")
-        return InvertedIndex(postings={}, doc_lengths={}, doc_ids=[], doc_lines={}, line_of_pos={})
-    try:
-        # 从 storage.py 加载
-        return load_index(INDEX_FILE)
-    except Exception as e:
-        print(f"ERROR: [API] Failed to load index file {INDEX_FILE}: {e}")
-        # 返回一个空的，以防文件损坏
-        return InvertedIndex(postings={}, doc_lengths={}, doc_ids=[], doc_lines={}, line_of_pos={})
-
+# --- 帮助函数 (保持不变) ---
 
 def _get_doc_path(doc_id: str) -> Path | None:
     """
     动态地在 UPLOAD_DIR 中查找文档路径。
-    这取代了 _DOC_PATHS 全局变量。
     """
-    # 假设 doc_id 是不带扩展名的文件名
-    # 我们需要搜索 .pdf 和 .txt
     p = UPLOAD_DIR / f"{doc_id}.pdf"
     if p.exists():
         return p
@@ -174,8 +171,6 @@ def _safe_doc_id(name: str) -> str:
     return os.path.splitext(base)[0]
 
 
-# --- 重构的帮助函数 (现在接收 index/analyzer 作为参数) ---
-
 def _terms_qs(terms: list[str]) -> str:
     """(保持不变)"""
     if not terms:
@@ -185,12 +180,11 @@ def _terms_qs(terms: list[str]) -> str:
 
 
 def _page_of_pos(
-    index: InvertedIndex,  # *** 4. 接收 'index' 作为参数 ***
+    index: InvertedIndex,
     doc_id: str, 
     pos: int
 ) -> int | None:
     """Get page number for token position"""
-    # 不再使用全局 _INDEX
     pm = index.page_map.get(doc_id)
     if not pm:
         return None
@@ -204,7 +198,7 @@ def _page_of_pos(
 
 
 def _all_term_positions(
-    index: InvertedIndex,  # *** 接收 'index' 作为参数 ***
+    index: InvertedIndex,
     doc_id: str, 
     terms: list[str]
 ) -> list[int]:
@@ -235,7 +229,7 @@ def _highlight_terms(text: str, terms: list[str]) -> str:
 
 
 def _paragraph_snippet(
-    index: InvertedIndex,  # *** 接收 'index' 作为参数 ***
+    index: InvertedIndex,
     doc_id: str, 
     start_pos: int | None, 
     terms: list[str],
@@ -255,7 +249,7 @@ def _paragraph_snippet(
     e = min(len(lines) - 1, hit + context_lines)
     block = "\n".join(lines[s : e + 1])
 
-    page = _page_of_pos(index, doc_id, start_pos) # *** 传递 'index' ***
+    page = _page_of_pos(index, doc_id, start_pos)
     html_block = (
         "<pre class='snippet'>" + 
         _highlight_terms(block, terms) + 
@@ -277,15 +271,12 @@ def _table_snippet(
     rwin: int = 1,
 ) -> HitData | None:
     """Extract table snippet if terms found in table"""
-    # *** 5. 重构为使用 _get_doc_path ***
     pdf_path = _get_doc_path(doc_id)
     if not pdf_path or pdf_path.suffix.lower() != ".pdf":
-        return None # 不是 PDF 或文件不存在
+        return None
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            # (其余的 pdfplumber 逻辑保持不变)
-            # ...
             if page_no < 0 or page_no >= len(pdf.pages):
                 return None
             page = pdf.pages[page_no]
@@ -318,7 +309,6 @@ def _table_snippet(
             tb = best[1]
             grid = tb.extract()
 
-            # Find hit cells
             hit_rc: list[tuple[int, int]] = []
             for ri, row in enumerate(grid):
                 for ci, cell in enumerate(row):
@@ -343,7 +333,6 @@ def _table_snippet(
                 c1 + cwin,
             )
 
-            # Extract sub-table
             sub_rows: list[list[str]] = []
             for rr in range(r0, r1 + 1):
                 row = grid[rr]
@@ -394,7 +383,7 @@ def _auto_mode(q: str) -> str:
     return "ranked"
 
 
-# --- 核心搜索路由逻辑 (重构为无状态) ---
+# --- 核心搜索路由逻辑 (已修改) ---
 
 def _perform_search(
     query: str,
@@ -405,9 +394,9 @@ def _perform_search(
 ) -> list[ResultDoc]:
     """Core search logic used by both GET and POST endpoints"""
     
-    # *** 6. 关键更改：在请求时加载索引和分析器 ***
-    index = get_index_instance()
-    analyzer = get_analyzer_instance()
+    # *** 关键修复：使用内存中的缓存实例 ***
+    index = _INDEX_CACHE
+    analyzer = _ANALYZER_CACHE
 
     if not index.doc_ids: # 索引为空或加载失败
         return []
@@ -427,14 +416,13 @@ def _perform_search(
         for doc_id in sorted(hits.keys()):
             if doc_id_filter and doc_id != doc_id_filter:
                 continue
-            # ... (其余逻辑不变, 但确保帮助函数调用被更新)
             starts = hits[doc_id]
             hits_to_show = starts[:max_hits_per_doc]
             shown_pages[doc_id] = set()
             
             out_hits: list[HitData] = []
             for st in hits_to_show:
-                page = _page_of_pos(index, doc_id, st) or 1 # *** 传递 index ***
+                page = _page_of_pos(index, doc_id, st) or 1
                 
                 table = _table_snippet(doc_id, page - 1, terms)
                 if table:
@@ -449,7 +437,7 @@ def _perform_search(
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
                 else:
-                    snippet = _paragraph_snippet(index, doc_id, st, terms, context_lines) # *** 传递 index ***
+                    snippet = _paragraph_snippet(index, doc_id, st, terms, context_lines)
                     if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
                             f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
@@ -475,13 +463,13 @@ def _perform_search(
             if doc_id_filter and doc_id != doc_id_filter:
                 continue
                 
-            all_positions = _all_term_positions(index, doc_id, terms) # *** 传递 index ***
+            all_positions = _all_term_positions(index, doc_id, terms)
             positions_to_show = all_positions[:max_hits_per_doc]
             shown_pages[doc_id] = set()
             
             out_hits: list[HitData] = []
             for pos in positions_to_show:
-                page = _page_of_pos(index, doc_id, pos) or 1 # *** 传递 index ***
+                page = _page_of_pos(index, doc_id, pos) or 1
                 
                 table = _table_snippet(doc_id, page - 1, terms)
                 if table:
@@ -496,7 +484,7 @@ def _perform_search(
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
                 else:
-                    snippet = _paragraph_snippet(index, doc_id, pos, terms, context_lines) # *** 传递 index ***
+                    snippet = _paragraph_snippet(index, doc_id, pos, terms, context_lines)
                     if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
                             f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
@@ -522,13 +510,13 @@ def _perform_search(
             if doc_id_filter and doc_id != doc_id_filter:
                 continue
                 
-            all_positions = _all_term_positions(index, doc_id, terms) # *** 传递 index ***
+            all_positions = _all_term_positions(index, doc_id, terms)
             positions_to_show = all_positions[:max_hits_per_doc]
             shown_pages[doc_id] = set()
             
             out_hits: list[HitData] = []
             for pos in positions_to_show:
-                page = _page_of_pos(index, doc_id, pos) or 1 # *** 传递 index ***
+                page = _page_of_pos(index, doc_id, pos) or 1
                 
                 table = _table_snippet(doc_id, page - 1, terms)
                 if table:
@@ -543,7 +531,7 @@ def _perform_search(
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
                 else:
-                    snippet = _paragraph_snippet(index, doc_id, pos, terms, context_lines) # *** 传递 index ***
+                    snippet = _paragraph_snippet(index, doc_id, pos, terms, context_lines)
                     if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
                             f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
@@ -565,14 +553,14 @@ def _perform_search(
     return results
 
 
-# --- 路由 (重构为无状态) ---
+# --- 路由 (已修改) ---
 
 @app.get("/", response_class=JSONResponse)
 def root_status() -> dict[str, Any]:
     """
-    根状态现在也从磁盘动态加载索引。
+    根状态现在从内存缓存中读取，速度飞快。
     """
-    idx = get_index_instance() # *** 7. 动态加载索引 ***
+    idx = _INDEX_CACHE # *** 修改：使用缓存 ***
     return {
         "app": "EviSearch-Py",
         "docs": len(idx.doc_ids) if idx else 0,
@@ -584,8 +572,7 @@ def root_status() -> dict[str, Any]:
 @app.get("/ui", response_class=HTMLResponse)
 def ui_page() -> HTMLResponse:
     """(保持不变)"""
-    # (保留你的 /ui HTML)
-    # ...
+    # (HTML 内容保持不变)
     return HTMLResponse("""
 <!doctype html>
 <html>
@@ -880,7 +867,7 @@ def ui_page() -> HTMLResponse:
 
 <script>
 // --- START: All JavaScript code is now encapsulated in one block ---
-
+// (JavaScript 保持不变)
 // Theme Toggle Logic
 const themeToggle = document.getElementById('themeToggle');
 const body = document.body;
@@ -972,8 +959,6 @@ async function getFileList() {
     try {
         const r = await fetch('/files');
         const j = await r.json();
-        // This function is called on page load after the list is built in the main script flow
-        // The visibility will be updated there
         return j.files || [];
     } catch (e) {
         return [];
@@ -1059,18 +1044,14 @@ function xhrUpload(file, row, fileId) {
         activeXHRs.set(fileId, xhr);
         xhr.open('POST', '/index-files');
         
-        // Progress event handler
         xhr.upload.onprogress = e => {
             if (e.lengthComputable) {
                 const p = Math.round((e.loaded / e.total) * 100);
                 row.querySelector('progress').value = p;
                 const statusSpan = row.querySelector('span');
-
                 if (p < 100) {
                     statusSpan.textContent = `uploading ${p}%`;
                 } else {
-                    // p is 100%
-                    // *** 8. 更新 UI 文本以反映异步处理 ***
                     statusSpan.textContent = `Processing...`;
                 }
             }
@@ -1080,11 +1061,6 @@ function xhrUpload(file, row, fileId) {
             activeXHRs.delete(fileId);
             if (xhr.status >= 200 && xhr.status < 300) {
                 row.querySelector('progress').value = 100;
-                // *** 9. 更新 UI 文本 ***
-                // 状态现在是 "Accepted" (已接收), 正在后台排队
-                // 我们将显示 "Queued" (已排队)，
-                // 并在 refreshState() 轮询时变为 "indexed"。
-                // (更高级的实现会使用 WebSocket 或轮询任务状态)
                 row.querySelector('span').textContent = 'Queued for indexing';
                 resolve();
             } else { 
@@ -1105,10 +1081,8 @@ function xhrUpload(file, row, fileId) {
     });
 }
 
-// Helper to convert hits data to HTML
 function createHitHtml(hits) {
     return hits.map((h, idx) => {
-      // Only show images, no text/table snippets in the UI
       if (h.snapshot_url) {
         return `<div class="hit">
           <div class="meta">Hit ${idx + 1}${h.page ? ` - Page ${h.page}` : ''}</div>
@@ -1119,16 +1093,9 @@ function createHitHtml(hits) {
     }).join('');
 }
                         
-
 async function doSearch() {
   results.innerHTML = '<div class="muted">Searching…</div>';
-  
-  const payload = {
-    q: q.value,
-    max_hits_per_doc: 5,
-    context_lines: 2
-  };
-  
+  const payload = { q: q.value, max_hits_per_doc: 5, context_lines: 2 };
   let jsonResponse;
   try {
       const r = await fetch('/search', {
@@ -1147,18 +1114,14 @@ async function doSearch() {
   for (const rdoc of jsonResponse.results) {
     const sc = rdoc.score !== undefined
       ? `<span class="badge">score ${rdoc.score.toFixed(3)}</span>` : '';
-    
     const ht = rdoc.total_hits
       ? `<span class="badge">${rdoc.hits.length} of ${rdoc.total_hits} hits</span>`
       : '';
-    
     const toggleLink = rdoc.has_more
       ? `<span class="toggle-hits-link show-all" style="cursor:pointer; color:var(--accent); text-decoration:underline; font-size:14px; margin-left:10px;" 
             onclick="updateDocHits('${rdoc.doc_id}', '${q.value.replace(/'/g, "\\'")}', true)">Show all hits</span>`
       : '';
-    
     const hitHtml = createHitHtml(rdoc.hits);
-    
     out.push(
       `<div class="card" data-doc-id="${rdoc.doc_id}">
         <div class="doc">
@@ -1171,29 +1134,23 @@ async function doSearch() {
       </div>`
     );
   }
-  
   results.innerHTML = out.join('') || '<div class="muted">No results.</div>';
 }
 
-// showAllHits 
 async function updateDocHits(docId, currentQuery, fetchAll) {
   const card = document.querySelector(`.card[data-doc-id='${docId}']`);
   if (!card) return;
-  
   const hitContainer = card.querySelector('.hit-container');
   const linkContainer = card.querySelector('.toggle-link-container');
   const hitBadge = card.querySelector('.doc .badge:nth-child(2)');
-
   if (hitContainer) hitContainer.innerHTML = '<div class="muted" style="margin-left:10px;">Loading...</div>';
-  if (linkContainer) linkContainer.innerHTML = ''; // Clear link while loading
-
+  if (linkContainer) linkContainer.innerHTML = '';
   const payload = {
     q: currentQuery,
     doc_id: docId,
-    max_hits_per_doc: fetchAll ? MAX_HITS_ALL : 5, // fetch all or default
+    max_hits_per_doc: fetchAll ? MAX_HITS_ALL : 5,
     context_lines: 2
   };
-  
   let jsonResponse;
   try {
     const r = await fetch('/search', {
@@ -1207,27 +1164,20 @@ async function updateDocHits(docId, currentQuery, fetchAll) {
     console.error(`Failed to load hits for ${docId}:`, e);
     return;
   }
-  
   const rdoc = jsonResponse.results[0];
   if (!rdoc) return;
-  
-  // 1. hits HTML
   if (hitContainer) {
       hitContainer.innerHTML = createHitHtml(rdoc.hits);
   }
-
-  // 2. hits badge update
   if (hitBadge) {
       hitBadge.textContent = `${rdoc.hits.length} of ${rdoc.total_hits} hits`;
   }
-
-  // 3. toggle link update
   if (linkContainer) {
     let newLink = '';
-    if (fetchAll && rdoc.total_hits > 5) { // If currently showing all hits and there are more than default
+    if (fetchAll && rdoc.total_hits > 5) {
         newLink = `<span class="toggle-hits-link collapse" style="cursor:pointer; color:var(--accent); text-decoration:underline; font-size:14px; margin-left:10px;" 
                         onclick="updateDocHits('${docId}', '${currentQuery.replace(/'/g, "\\'")}', false)">Collapse</span>`;
-    } else if (!fetchAll && rdoc.has_more) { // If currently showing default hits and there are more
+    } else if (!fetchAll && rdoc.has_more) {
         newLink = `<span class="toggle-hits-link show-all" style="cursor:pointer; color:var(--accent); text-decoration:underline; font-size:14px; margin-left:10px;" 
                         onclick="updateDocHits('${docId}', '${currentQuery.replace(/'/g, "\\'")}', true)">Show all hits</span>`;
     }
@@ -1243,40 +1193,30 @@ function openLightbox(src) {
   translateX = 0;
   translateY = 0;
   updateTransform();
-  
-  // Hide hint after 3 seconds
   setTimeout(() => {
     const hint = document.querySelector('.lightbox-hint');
     if (hint) hint.style.opacity = '0';
   }, 3000);
 }
-
 function closeLightbox() {
   lightbox.classList.remove('active');
   const hint = document.querySelector('.lightbox-hint');
   if (hint) hint.style.opacity = '1';
 }
-
 function updateTransform() {
   lightboxImg.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
 }
-
-// Lightbox event handlers
 lightboxClose.onclick = closeLightbox;
-
 lightbox.addEventListener('wheel', e => {
   if (!lightbox.classList.contains('active')) return;
   e.preventDefault();
-  
   const delta = e.deltaY > 0 ? 0.9 : 1.1;
   const newScale = scale * delta;
-  
   if (newScale >= 0.5 && newScale <= 5) {
     scale = newScale;
     updateTransform();
   }
 });
-
 lightbox.addEventListener('mousedown', e => {
   if (e.target === lightboxImg) {
     isDragging = true;
@@ -1286,7 +1226,6 @@ lightbox.addEventListener('mousedown', e => {
     e.preventDefault();
   }
 });
-
 lightbox.addEventListener('mousemove', e => {
   if (isDragging) {
     translateX = e.clientX - startX;
@@ -1295,45 +1234,39 @@ lightbox.addEventListener('mousemove', e => {
     e.preventDefault();
   }
 });
-
 lightbox.addEventListener('mouseup', e => {
   if (isDragging) {
     isDragging = false;
     lightbox.classList.remove('dragging');
   }
 });
-
 lightbox.addEventListener('mouseleave', e => {
   if (isDragging) {
     isDragging = false;
     lightbox.classList.remove('dragging');
   }
 });
-
 lightbox.addEventListener('click', e => {
   if (e.target === lightbox) {
     closeLightbox();
   }
 });
-
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && lightbox.classList.contains('active')) {
     closeLightbox();
   }
 });
-
 go.onclick = doSearch;
 q.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
 
 // Initial Page Load Actions
 applyInitialTheme();
 refreshState();
-// Logic to populate initial file list and then update button visibility
 (async () => {
     const initialFiles = await getFileList();
     filesDiv.innerHTML = '';
     initialFiles.forEach(fileName => {
-        const row = createFileRow(fileName, fileName); // Use fileName as a simple ID
+        const row = createFileRow(fileName, fileName);
         row.querySelector('progress').style.display = 'none';
         row.querySelector('span').textContent = 'indexed';
         row.querySelector('.btn.danger').style.display = 'block';
@@ -1341,7 +1274,6 @@ refreshState();
     });
     updateDeleteAllButtonVisibility();
 })();
-
 // --- END: JavaScript block ---
 </script>
 </body>
@@ -1360,7 +1292,7 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     
     count = 0
-    files_saved = False # <--- 1. 添加一个标志
+    files_saved = False
     
     for f in files:
         if not f.filename:
@@ -1374,22 +1306,19 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
         try:
             with dest.open("wb") as w:
                 w.write(await f.read())
-            
             count += 1
-            files_saved = True # <--- 2. 设置标志
-            
+            files_saved = True
         except Exception as e:
             print(f"ERROR: [API] Failed to save {f.filename}: {e}")
 
-    # *** 10. 将任务分派移到循环之外 ***
     if files_saved:
         print(f"INFO: [API] {count} files saved. Triggering re-index.")
-        trigger_reindex.delay() # <--- 3. 只在这里调用一次
+        trigger_reindex.delay()
     
     return IndexOut(
         ok=True, 
         indexed=count,
-        vocab=get_index_instance().vocabulary_size()
+        vocab=_INDEX_CACHE.vocabulary_size() # *** 修改：返回当前缓存的词汇量 ***
     )
 
 
@@ -1397,10 +1326,8 @@ async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: 
 def list_files() -> FileListOut:
     """
     *** 11. 重构的 /files 端点 ***
-    不再从内存变量读取，而是直接扫描 UPLOAD_DIR。
     """
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    # 我们只返回 doc_id (不带扩展名的文件名)
     files = sorted(set(_safe_doc_id(p.name) for p in UPLOAD_DIR.glob("*.*")))
     return FileListOut(files=files)
 
@@ -1409,7 +1336,6 @@ def list_files() -> FileListOut:
 def delete_all_files() -> DeleteOut:
     """
     *** 12. 重构的 /delete-all 端点 ***
-    删除所有文件，然后触发一次重新索引。
     """
     deleted_count = 0
     for p in UPLOAD_DIR.glob("*.*"):
@@ -1419,9 +1345,7 @@ def delete_all_files() -> DeleteOut:
         except Exception as e:
             print(f"WARN: [API] Could not delete file {p.name}: {e}")
 
-    # 触发一次空的重建（这将清空索引）
     trigger_reindex.delay()
-
     return DeleteOut(ok=True, message=f"All {deleted_count} files removed. Re-indexing triggered.")
 
 
@@ -1429,16 +1353,13 @@ def delete_all_files() -> DeleteOut:
 def delete_file(name: str) -> DeleteOut: 
     """
     *** 13. 重构的 /delete-one 端点 ***
-    删除一个文件（及其所有扩展名变体），然后触发一次重新索引。
     """
     decoded_name = ul.unquote_plus(name)
-    # name 可能是 doc_id 或完整文件名，我们使用 _safe_doc_id 来标准化
     doc_id = _safe_doc_id(decoded_name)
     
     if not doc_id:
         raise HTTPException(404, f"Document '{decoded_name}' is invalid")
     
-    # 查找此 doc_id 的所有文件 (.pdf, .txt 等)
     files_to_delete = list(UPLOAD_DIR.glob(f"{doc_id}.*"))
     
     if not files_to_delete:
@@ -1453,9 +1374,7 @@ def delete_file(name: str) -> DeleteOut:
             print(f"WARN: [API] Could not delete file {p.name}: {e}")
             raise HTTPException(500, f"Failed to delete file {p.name}")
 
-    # 触发重建
     trigger_reindex.delay()
-
     return DeleteOut(ok=True, message=f"Removed {deleted_name}. Re-indexing triggered.")
 
 
@@ -1470,6 +1389,38 @@ def search_endpoint(payload: SearchIn) -> SearchOut:
         context_lines=payload.context_lines,
     )
     return SearchOut(results=results)
+
+
+# *** --- 新增的端点 --- ***
+@app.post("/reload-index", 
+          status_code=202, 
+          dependencies=[Depends(_check_auth)], 
+          response_model=IndexOut)
+def reload_index_endpoint():
+    """
+    一个受保护的端点，用于触发 API 进程从磁盘重新加载索引。
+    这应该在 Celery 完成 'trigger_reindex' 任务后被调用。
+    """
+    global _INDEX_CACHE, _ANALYZER_CACHE # 引用全局变量
+    try:
+        print("INFO: [API] /reload-index 被调用，正在重新加载索引...")
+        
+        # *** 执行与启动时相同的加载操作 ***
+        _INDEX_CACHE = get_index_instance() 
+        _ANALYZER_CACHE = get_analyzer_instance()
+        
+        vocab_size = _INDEX_CACHE.vocabulary_size()
+        print(f"INFO: [API] 索引重新加载完毕。新词汇量: {vocab_size}")
+        
+        return IndexOut(
+            ok=True, 
+            indexed=len(_INDEX_CACHE.doc_ids), # 报告当前文档数
+            vocab=vocab_size
+        )
+    except Exception as e:
+        print(f"ERROR: [API] 重新加载索引失败: {e}")
+        raise HTTPException(500, "Failed to reload index")
+# *** --- 新增结束 --- ***
 
 
 @app.get(
@@ -1492,11 +1443,10 @@ def page_snapshot(
 ):
     """
     *** 14. 重构的 /page-snapshot 端点 ***
-    (大部分保持不变，只是使用了 _get_doc_path)
+    (这个函数不需要修改，因为它不依赖索引缓存)
     """
     decoded_doc_id = ul.unquote_plus(doc_id)
     
-    # 使用新的帮助函数
     pdf_path = _get_doc_path(decoded_doc_id)
     
     if not pdf_path or pdf_path.suffix.lower() != ".pdf":
@@ -1506,8 +1456,6 @@ def page_snapshot(
     if not (1.0 <= scale <= 4.0):
         scale = 3.0
 
-    # (其余逻辑与你的原始 api.py 完全相同)
-    # ...
     box_list: list[tuple[float, float, float, float]] = []
     if boxes:
         try:

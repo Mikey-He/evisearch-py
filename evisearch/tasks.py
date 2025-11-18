@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
-
 import ocrmypdf
+import requests  # <-- *** 1. 新增导入 ***
+from requests.auth import HTTPBasicAuth  # <-- *** 2. 新增导入 ***
 
 from .analyzer import Analyzer
 from .celery_app import celery_app  # import the Celery app instance
@@ -69,7 +70,7 @@ def _rebuild_index_and_save() -> int:
                         ocrmypdf.ocr(
                             path,
                             path,
-                            redo_ocr=True,  # <--- 对扫描件使用 redo_ocr 是正确的
+                            redo_ocr=True,
                             output_type="pdf",
                             language='eng',
                             jobs=1,
@@ -78,7 +79,6 @@ def _rebuild_index_and_save() -> int:
                         print(f"INFO: [Worker] OCR complete for {path.name}.")
                     except Exception as ocr_error:
                         print(f"ERROR: [Worker] ocrmypdf failed for {path.name}: {ocr_error}")
-                        # 如果 OCR 失败，我们将无法提取任何文本
                         continue # 跳到下一个文件
                 else:
                     # 2. 如果是文本 PDF，打印日志并跳过 OCR
@@ -131,15 +131,44 @@ def trigger_reindex() -> dict[str, Any]:
         return {"status": "skipped", "message": "Index build already in progress."}
 
     print("INFO: [Worker] Lock acquired. Starting full re-index...")
+    
+    # *** 3. 修改：将结果存储在变量中 ***
+    result = {} 
+    
     try:
         vocab_size = _rebuild_index_and_save()
-        return {"status": "success", "vocab_size": vocab_size}
+        result = {"status": "success", "vocab_size": vocab_size} # <-- 修改
     except Exception as e:
         print(f"ERROR: [Worker] Re-index failed: {e}")
-        return {"status": "error", "error": str(e)}
+        result = {"status": "error", "error": str(e)} # <-- 修改
     finally:
         _INDEX_WRITE_LOCK.release()
         print("INFO: [Worker] Lock released.")
+
+    # *** 4. 新增：如果成功，通知 API 进程重载缓存 ***
+    if result.get("status") == "success":
+        try:
+            print("INFO: [Worker] Index built. Notifying API server to reload cache...")
+            # 从环境变量获取认证信息
+            user = os.getenv("BASIC_USER") or ""
+            pwd = os.getenv("BASIC_PASS") or ""
+            
+            # Gunicorn 运行在 10000 端口 (根据你的 start.sh)
+            # 我们从 worker 内部调用 API
+            response = requests.post(
+                "http://localhost:10000/reload-index",
+                auth=HTTPBasicAuth(user, pwd) if user and pwd else None,
+                timeout=5
+            )
+            if response.status_code == 202:
+                print("INFO: [Worker] API server successfully triggered for cache reload.")
+            else:
+                print(f"WARN: [Worker] API server returned {response.status_code} on cache reload.")
+        except Exception as e:
+            print(f"ERROR: [Worker] Failed to notify API server to reload cache: {e}")
+
+    return result # <-- 修改
+
 
 def is_pdf_scanned(path: Path) -> bool:
     """
