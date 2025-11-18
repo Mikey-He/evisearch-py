@@ -9,7 +9,10 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY . .
+
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir .
 
-CMD ["gunicorn", "evisearch.api:app", "--bind", "0.0.0.0:10000", "--timeout", "300", "--workers", "1", "--worker-class", "uvicorn.workers.UvicornWorker"]
+RUN chmod +x ./start.sh
+
+CMD ["./start.sh"]

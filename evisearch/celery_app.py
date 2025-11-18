@@ -1,17 +1,17 @@
 from __future__ import annotations
 
+import os  # <--- 1. 添加 import os
 from celery import Celery
 
-# configure Celery instance 
-# /0 and /1 are Redis database numbers
-BROKER_URL = "redis://localhost:6379/0"
-BACKEND_URL = "redis://localhost:6379/1"
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+BROKER_URL = f"{REDIS_URL}/0"
+BACKEND_URL = f"{REDIS_URL}/1"
 
 celery_app = Celery(
     "evisearch",
     broker=BROKER_URL,
     backend=BACKEND_URL,
-    # Auto-discover tasks in the 'evisearch.tasks' module
     include=["evisearch.tasks"],
 )
 
