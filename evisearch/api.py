@@ -83,30 +83,31 @@ print(f"INFO: [API] 初始索引加载完毕。词汇量: {_INDEX_CACHE.vocabula
 # 基础认证 (保持不变)
 basic_user = os.getenv("BASIC_USER") or ""
 basic_pass = os.getenv("BASIC_PASS") or ""
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)
 
 def _needs_auth() -> bool:
     return bool(basic_user and basic_pass)
 
 def _check_auth(
-    # --- 修改 1: 添加 | None 并设置 auto_error=False ---
-    credentials: HTTPBasicCredentials | None = Depends(security, auto_error=False)
+    # --- 修复：移除 auto_error，因为它现在在上面的 HTTPBasic 中 ---
+    credentials: HTTPBasicCredentials | None = Depends(security)
 ) -> None:
-    # --- 修改 2: 检查 _needs_auth() 仍然是第一位 ---
+
+    # --- 逻辑不变：检查认证是否被禁用 ---
     if not _needs_auth():
-        # 认证被禁用了，直接通过
+        # 认证被禁用了（USER/PASS 都是空），直接通过
         return
 
-    # --- 修改 3: 如果认证已启用，但未提供凭据，则报错 ---
+    # --- 新逻辑：如果认证已启用，但未提供凭据，则报错 ---
+    # （因为 auto_error=False, credentials 会是 None 而不是自动 401）
     if credentials is None:
         # 认证已启用，但 tasks.py (或用户) 没有提供密码
         raise HTTPException(status_code=401, detail="Credentials are required")
 
-    # --- 修改 4: 凭据已提供，检查它们是否正确 ---
+    # --- 逻辑不变：凭据已提供，检查它们是否正确 ---
     ok = credentials.username == basic_user and credentials.password == basic_pass
     if not ok:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-
 
 # --- 模型 (保持不变) ---
 class DocIn(BaseModel):
