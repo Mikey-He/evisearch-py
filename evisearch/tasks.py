@@ -68,7 +68,7 @@ def _rebuild_index_and_save() -> int:
                     ocrmypdf.ocr(
                         path,             # input_file
                         path,             # output_file (覆盖它自己)
-                        redo_ocr=True,   
+                        skip_text=True,   
                         language='eng',   # 假设是英语
                         jobs=1,           # 限制为1个核心，以免 Celery worker 过载
                         progress_bar=False,
