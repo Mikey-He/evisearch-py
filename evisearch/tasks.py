@@ -61,32 +61,35 @@ def _rebuild_index_and_save() -> int:
             page_map = []
             
             if path.suffix.lower() == ".pdf":
-                print(f"INFO: [Worker] Running OCR (ocrmypdf) on {path.name}...")
-                try:
-                    # 这会运行 OCR 并*覆盖*原始文件，
-                    # 创造一个“三明治 PDF”
-                    ocrmypdf.ocr(
-                        path,             # input_file
-                        path,             # output_file (覆盖它自己)
-                        skip_text=True, 
-                        output_type="pdf",
-                        language='eng',   # 假设是英语
-                        jobs=1,           # 限制为1个核心，以免 Celery worker 过载
-                        progress_bar=False,)
-                    print(f"INFO: [Worker] OCR complete for {path.name}.")
-                except Exception as ocr_error:
-                    # 如果 ocrmypdf 失败 (例如，PDF 损坏或受密码保护)
-                    print(f"ERROR: [Worker] ocrmypdf failed for {path.name}: {ocr_error}")
-                    # 我们仍然尝试用 fitz 提取文本（以防万一）
-                    pass
-                
+
+                if is_pdf_scanned(path):
+                    # 1. 只有在文件是扫描件时，才运行 ocrmypdf
+                    print(f"INFO: [Worker] PDF {path.name} seems scanned. Running OCR (ocrmypdf)...")
+                    try:
+                        ocrmypdf.ocr(
+                            path,
+                            path,
+                            redo_ocr=True,  # <--- 对扫描件使用 redo_ocr 是正确的
+                            output_type="pdf",
+                            language='eng',
+                            jobs=1,
+                            progress_bar=False,
+                        )
+                        print(f"INFO: [Worker] OCR complete for {path.name}.")
+                    except Exception as ocr_error:
+                        print(f"ERROR: [Worker] ocrmypdf failed for {path.name}: {ocr_error}")
+                        # 如果 OCR 失败，我们将无法提取任何文本
+                        continue # 跳到下一个文件
+                else:
+                    # 2. 如果是文本 PDF，打印日志并跳过 OCR
+                    print(f"INFO: [Worker] PDF {path.name} is text-based. Skipping OCR.")
+
                 texts: list[str] = []
                 pos = 0
                 with fitz.open(str(path)) as doc:
                     for i, page in enumerate(doc, start=1):
                         txt = page.get_text() or ""
                         texts.append(txt)
-                        # 我们仍然需要构建 page_map 以便索引器工作
                         toks = list(_ANALYZER.iter_tokens(txt, keep_stopwords=True))
                         page_map.append((pos, i))
                         pos += len(toks)
@@ -137,3 +140,27 @@ def trigger_reindex() -> dict[str, Any]:
     finally:
         _INDEX_WRITE_LOCK.release()
         print("INFO: [Worker] Lock released.")
+
+def is_pdf_scanned(path: Path) -> bool:
+    """
+    Check if a PDF is scanned (image-based) by sampling the first few pages.
+    Returns True if it's likely scanned, False if it's text-based.
+    """
+    try:
+        with fitz.open(str(path)) as doc:
+            # 检查前 5 页（或所有页面，如果少于 5 页）
+            num_pages_to_check = min(len(doc), 5)
+            if num_pages_to_check == 0:
+                return False  # 空 PDF
+
+            total_text_length = 0
+            for i in range(num_pages_to_check):
+                page = doc.load_page(i)
+                total_text_length += len(page.get_text())
+
+            # 如果平均每页的字符数少于 100，我们*假设*它是扫描件
+            avg_chars = total_text_length / num_pages_to_check
+            return avg_chars < 100
+    except Exception as e:
+        print(f"WARN: [Worker] is_pdf_scanned check failed for {path.name}: {e}")
+        return False # 出错时，默认为文本 PDF
