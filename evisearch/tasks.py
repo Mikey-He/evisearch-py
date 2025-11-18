@@ -68,11 +68,11 @@ def _rebuild_index_and_save() -> int:
                     ocrmypdf.ocr(
                         path,             # input_file
                         path,             # output_file (覆盖它自己)
-                        skip_text=True,   
+                        skip_text=True, 
+                        output_type="pdf",
                         language='eng',   # 假设是英语
                         jobs=1,           # 限制为1个核心，以免 Celery worker 过载
-                        progress_bar=False,
-                    )
+                        progress_bar=False,)
                     print(f"INFO: [Worker] OCR complete for {path.name}.")
                 except Exception as ocr_error:
                     # 如果 ocrmypdf 失败 (例如，PDF 损坏或受密码保护)
