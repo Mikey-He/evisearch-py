@@ -18,6 +18,11 @@ dependencies = [
     "Pillow>=10.0.0",
     "pydantic>=2.0.0",
     "python-multipart>=0.0.6",
+    "pytesseract>=0.3.10",
+    "celery>=5.0.0",
+    "redis>=4.0.0",
+    "ocrmypdf>=15.0.0",
+    "gunicorn>=20.0.0"
 ]
 
 #  Optional dependencies for development and testing
@@ -27,12 +32,7 @@ dev = [
     "pytest-cov>=4.1.0",
     "mypy>=1.5.0",
     "ruff>=0.1.0",
-    "black>=23.0.0",
-    "pytesseract>=0.3.10",
-    "celery>=5.0.0",
-    "redis>=4.0.0",
-    "ocrmypdf>=15.0.0",
-    "gunicorn>=20.0.0"
+    "black>=23.0.0"
 ]
 
 #  --------- Setuptools ----------
