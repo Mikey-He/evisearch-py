@@ -3,11 +3,13 @@ pyproject.toml
 evisearch/__init__.py
 evisearch/analyzer.py
 evisearch/api.py
+evisearch/celery_app.py
 evisearch/cli.py
 evisearch/highlight.py
 evisearch/indexer.py
 evisearch/searcher.py
 evisearch/storage.py
+evisearch/tasks.py
 evisearch_py.egg-info/PKG-INFO
 evisearch_py.egg-info/SOURCES.txt
 evisearch_py.egg-info/dependency_links.txt

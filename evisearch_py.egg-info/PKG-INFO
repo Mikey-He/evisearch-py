@@ -20,6 +20,7 @@ Requires-Dist: black>=23.0.0; extra == "dev"
 Requires-Dist: pytesseract>=0.3.10; extra == "dev"
 Requires-Dist: celery>=5.0.0; extra == "dev"
 Requires-Dist: redis>=4.0.0; extra == "dev"
+Requires-Dist: ocrmypdf>=15.0.0; extra == "dev"
 
 ﻿
 # EviSearch-Py

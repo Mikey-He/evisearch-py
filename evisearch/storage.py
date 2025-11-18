@@ -19,7 +19,7 @@ def save_index(index: InvertedIndex, path: str | Path) -> None:
         "line_of_pos": index.line_of_pos,    # doc_id -> [lineIndex, ...]
         "page_map": getattr(index, "page_map", {}),
     }
-    p.write_text(json.dumps(data, ensure_ascii=False))
+    p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
 def load_index(path: str | Path) -> InvertedIndex:

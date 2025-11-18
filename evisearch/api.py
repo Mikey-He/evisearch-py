@@ -7,59 +7,58 @@ import io
 import os
 from pathlib import Path
 import re
-import threading
 from typing import Annotated, Any
 import urllib.parse as ul
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-import fitz  # PyMuPDF  # type: ignore[import-untyped]
+import fitz  # PyMuPDF
+from pydantic import BaseModel, Field
 import pdfplumber
 from PIL import Image, ImageDraw
-from pydantic import BaseModel, Field
-import pytesseract
+# 注意：pytesseract 已被移除，因为它现在只存在于 tasks.py 中
+# import pytesseract 
 
 from .analyzer import Analyzer
-from .indexer import IndexWriter, InvertedIndex
+from .indexer import InvertedIndex  # 我们仍需要 InvertedIndex 这个 *类型*
 from .searcher import PhraseMatcher, Searcher
+from .storage import load_index       # *** 1. 导入 load_index ***
+from .tasks import trigger_reindex  # *** 2. 导入我们的 Celery 任务 ***
 
-# App & global state
-
-app = FastAPI(title="EviSearch-Py", version="1.4.1-FIXED") # Version update
+# App & 全局配置 (无状态)
+app = FastAPI(title="EviSearch-Py (Async)", version="2.0.0")
 
 DATA_DIR = Path("data")
 UPLOAD_DIR = DATA_DIR / "uploads"
+INDEX_FILE = DATA_DIR / "index.json"  # 索引的磁盘路径
 DATA_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-_ANALYZER = Analyzer()
-_INDEX_LOCK = threading.Lock()
-_INDEX: InvertedIndex | None = None
-
-# doc_id -> original file path
-_DOC_PATHS: dict[str, str] = {}
-# doc_id -> (text, page_map) for rebuilding index
-_DOC_DATA: dict[str, tuple[str, list[tuple[int, int]]]] = {}
-
-_FILENAME_TO_DOC_ID: dict[str, str] = {}
-# Default context windows
+# 默认上下文窗口 (保持不变)
 DEFAULT_LINES_WINDOW = 1
 DEFAULT_COL_WINDOW = 1
 
-# Maximum hits settings
+# 最大命中设置 (保持不变)
 MAX_HITS_DEFAULT = 3
 MAX_HITS_ALL = 50
 
-# Optional Basic Auth
+# --- 全局状态变量 (已全部移除) ---
+# _ANALYZER = Analyzer()                 <- 已移除
+# _INDEX_LOCK = threading.Lock()           <- 已移除 (移至 tasks.py)
+# _INDEX: InvertedIndex | None = None      <- 已移除
+# _DOC_PATHS: dict[str, str] = {}         <- 已移除
+# _DOC_DATA: dict[str, tuple[str, ...]] = {} <- 已移除
+# _FILENAME_TO_DOC_ID: dict[str, str] = {} <- 已移除 (将简化)
+# -------------------------------------
+
+# 基础认证 (保持不变)
 basic_user = os.getenv("BASIC_USER") or ""
 basic_pass = os.getenv("BASIC_PASS") or ""
 security = HTTPBasic()
 
-
 def _needs_auth() -> bool:
     return bool(basic_user and basic_pass)
-
 
 def _check_auth(
     credentials: HTTPBasicCredentials = Depends(security)  # noqa: B008
@@ -71,23 +70,23 @@ def _check_auth(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-# Models
-
+# --- 模型 (保持不变) ---
+# (保留 DocIn, IndexIn, IndexOut, SearchIn, HitData, 
+#  ResultDoc, SearchOut, DeleteOut, FileListOut 的所有 Pydantic 模型)
+# (为了简洁，这里省略了它们...
+#  请确保你保留了 api.py 中所有的 Pydantic "class" 定义)
 class DocIn(BaseModel):
     id: str
     text: str
     page_map: list[tuple[int, int]] = Field(default_factory=list)
 
-
 class IndexIn(BaseModel):
     docs: list[DocIn]
 
-
 class IndexOut(BaseModel):
     ok: bool
-    indexed: int
-    vocab: int
-
+    indexed: int  # 将报告已接收的文件数
+    vocab: int    # 将报告磁盘上当前的词汇量
 
 class SearchIn(BaseModel):
     q: str
@@ -95,7 +94,6 @@ class SearchIn(BaseModel):
     doc_id: str | None = None
     max_hits_per_doc: int = MAX_HITS_DEFAULT
     context_lines: int = DEFAULT_LINES_WINDOW
-
 
 class HitData(BaseModel):
     kind: str
@@ -106,7 +104,6 @@ class HitData(BaseModel):
     snapshot_url: str | None = None
     bbox: list[float] | None = None
 
-
 class ResultDoc(BaseModel):
     doc_id: str
     score: float | None = None
@@ -114,89 +111,87 @@ class ResultDoc(BaseModel):
     total_hits: int
     has_more: bool = False
 
-
 class SearchOut(BaseModel):
     results: list[ResultDoc]
-
 
 class DeleteOut(BaseModel):
     ok: bool
     message: str
 
-
 class FileListOut(BaseModel):
     files: list[str]
+# --- 模型结束 ---
 
 
-# Helpers
+# --- 帮助函数 (重构为无状态) ---
+
+def get_analyzer_instance() -> Analyzer:
+    """按需创建分析器实例 (非常快)"""
+    return Analyzer()
+
+
+def get_index_instance() -> InvertedIndex:
+    """
+    *** 3. 关键的无状态函数 ***
+    在需要时从磁盘加载索引。
+    这使得 API 可以即时获取 worker 重建的最新索引。
+    """
+    if not INDEX_FILE.exists():
+        # 如果文件不存在，返回一个空的索引
+        print("WARN: [API] index.json not found. Returning empty index.")
+        return InvertedIndex(postings={}, doc_lengths={}, doc_ids=[], doc_lines={}, line_of_pos={})
+    try:
+        # 从 storage.py 加载
+        return load_index(INDEX_FILE)
+    except Exception as e:
+        print(f"ERROR: [API] Failed to load index file {INDEX_FILE}: {e}")
+        # 返回一个空的，以防文件损坏
+        return InvertedIndex(postings={}, doc_lengths={}, doc_ids=[], doc_lines={}, line_of_pos={})
+
+
+def _get_doc_path(doc_id: str) -> Path | None:
+    """
+    动态地在 UPLOAD_DIR 中查找文档路径。
+    这取代了 _DOC_PATHS 全局变量。
+    """
+    # 假设 doc_id 是不带扩展名的文件名
+    # 我们需要搜索 .pdf 和 .txt
+    p = UPLOAD_DIR / f"{doc_id}.pdf"
+    if p.exists():
+        return p
+    p = UPLOAD_DIR / f"{doc_id}.txt"
+    if p.exists():
+        return p
+    
+    print(f"WARN: [API] Could not find path for doc_id: {doc_id}")
+    return None
+
+def _safe_doc_id(name: str) -> str:
+    """(这与 tasks.py 中的版本相同)"""
+    base = os.path.basename(name or "doc")
+    base = re.sub(r'\s+', '_', base)
+    base = base.replace('/', '_').replace('\\', '_').replace('\0', '_')
+    return os.path.splitext(base)[0]
+
+
+# --- 重构的帮助函数 (现在接收 index/analyzer 作为参数) ---
 
 def _terms_qs(terms: list[str]) -> str:
+    """(保持不变)"""
     if not terms:
         return ""
     qs = ",".join(ul.quote_plus(t) for t in terms if t)
     return f"&terms={qs}"
 
-def _safe_doc_id(name: str) -> str:
-    """Create safe document ID from filename."""
-    base = os.path.basename(name or "doc")
-    base = re.sub(r'\s+', '_', base)
-    # Only replace truly problematic characters that might cause file system issues
-    base = base.replace('/', '_').replace('\\', '_').replace('\0', '_')
-    return base
 
-def _extract_pdf_text_and_page_map(
-    path: Path,
-) -> tuple[str, list[tuple[int, int]]]:
-    """
-    Extract page texts and page_map using PyMuPDF (fitz).
-    Fallback to OCR for scanned PDFs.
-    """
-    texts: list[str] = []
-    page_map: list[tuple[int, int]] = []
-    pos = 0
-
-    # OCR threshold: if average chars per page is below this, do OCR
-    OCR_THRESHOLD_CHARS_PER_PAGE = 50 
-
-    with fitz.open(str(path)) as doc:
-        # try to extract text normally
-        plain_texts = [page.get_text() or "" for page in doc]
-        total_chars = sum(len(t) for t in plain_texts)
-
-        # Decide if OCR is needed
-        if total_chars < len(doc) * OCR_THRESHOLD_CHARS_PER_PAGE and len(doc) > 0:
-            print(f"INFO: Low text content for {path.name}. Attempting OCR...")
-            # OCR Fallback
-            for i, page in enumerate(doc, start=1):
-                # Render page to image
-                pix = page.get_pixmap(dpi=200) 
-                img_data = pix.tobytes("png")
-                img = Image.open(io.BytesIO(img_data))
-
-                # Perform OCR
-                try:
-                    txt = pytesseract.image_to_string(img, lang='eng', timeout= 60) 
-                except Exception as e:
-                    print(f"WARN: OCR failed for page {i} of {path.name}: {e}")
-                    txt = "" 
-                texts.append(txt)
-        else:
-            texts = plain_texts
-
-        # Build page map
-        for i, txt in enumerate(texts, start=1):
-            toks = list(_ANALYZER.iter_tokens(txt, keep_stopwords=True))
-            page_map.append((pos, i))
-            pos += len(toks)
-
-    joined = "\n\n".join(texts)
-    return joined, page_map
-
-def _page_of_pos(doc_id: str, pos: int) -> int | None:
+def _page_of_pos(
+    index: InvertedIndex,  # *** 4. 接收 'index' 作为参数 ***
+    doc_id: str, 
+    pos: int
+) -> int | None:
     """Get page number for token position"""
-    if _INDEX is None:
-        return None
-    pm = _INDEX.page_map.get(doc_id)
+    # 不再使用全局 _INDEX
+    pm = index.page_map.get(doc_id)
     if not pm:
         return None
     page = None
@@ -209,15 +204,14 @@ def _page_of_pos(doc_id: str, pos: int) -> int | None:
 
 
 def _all_term_positions(
+    index: InvertedIndex,  # *** 接收 'index' 作为参数 ***
     doc_id: str, 
     terms: list[str]
 ) -> list[int]:
     """Get all positions where any term appears"""
-    if _INDEX is None:
-        return []
     positions = []
     for t in terms:
-        posting = _INDEX.get_posting(t)
+        posting = index.get_posting(t)
         if not posting:
             continue
         plist = posting.get(doc_id, [])
@@ -226,7 +220,7 @@ def _all_term_positions(
 
 
 def _highlight_terms(text: str, terms: list[str]) -> str:
-    """Escape HTML and wrap matches with <mark>"""
+    """(保持不变)"""
     if not terms:
         return html.escape(text)
     pats = sorted(set(t for t in terms if t), key=len, reverse=True)
@@ -241,17 +235,18 @@ def _highlight_terms(text: str, terms: list[str]) -> str:
 
 
 def _paragraph_snippet(
+    index: InvertedIndex,  # *** 接收 'index' 作为参数 ***
     doc_id: str, 
     start_pos: int | None, 
     terms: list[str],
     context_lines: int = DEFAULT_LINES_WINDOW
 ) -> HitData:
     """Build line-window snippet"""
-    if _INDEX is None or start_pos is None:
+    if start_pos is None:
         return HitData(kind="text", snippet_html="", line=0, page=None)
 
-    lines = _INDEX.doc_lines.get(doc_id, [])
-    line_of_pos = _INDEX.line_of_pos.get(doc_id, [])
+    lines = index.doc_lines.get(doc_id, [])
+    line_of_pos = index.line_of_pos.get(doc_id, [])
     if not lines or not line_of_pos or start_pos >= len(line_of_pos):
         return HitData(kind="text", snippet_html="", line=0, page=None)
 
@@ -260,7 +255,7 @@ def _paragraph_snippet(
     e = min(len(lines) - 1, hit + context_lines)
     block = "\n".join(lines[s : e + 1])
 
-    page = _page_of_pos(doc_id, start_pos)
+    page = _page_of_pos(index, doc_id, start_pos) # *** 传递 'index' ***
     html_block = (
         "<pre class='snippet'>" + 
         _highlight_terms(block, terms) + 
@@ -282,12 +277,15 @@ def _table_snippet(
     rwin: int = 1,
 ) -> HitData | None:
     """Extract table snippet if terms found in table"""
-    pdf_path = _DOC_PATHS.get(doc_id)
-    if not pdf_path or not os.path.exists(pdf_path):
-        return None
+    # *** 5. 重构为使用 _get_doc_path ***
+    pdf_path = _get_doc_path(doc_id)
+    if not pdf_path or pdf_path.suffix.lower() != ".pdf":
+        return None # 不是 PDF 或文件不存在
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
+            # (其余的 pdfplumber 逻辑保持不变)
+            # ...
             if page_no < 0 or page_no >= len(pdf.pages):
                 return None
             page = pdf.pages[page_no]
@@ -385,7 +383,7 @@ def _table_snippet(
 
 
 def _auto_mode(q: str) -> str:
-    """Detect search mode from query"""
+    """(保持不变)"""
     q2 = q.strip()
     if not q2:
         return "ranked"
@@ -396,6 +394,8 @@ def _auto_mode(q: str) -> str:
     return "ranked"
 
 
+# --- 核心搜索路由逻辑 (重构为无状态) ---
+
 def _perform_search(
     query: str,
     mode: str | None = None,
@@ -404,38 +404,40 @@ def _perform_search(
     context_lines: int = DEFAULT_LINES_WINDOW
 ) -> list[ResultDoc]:
     """Core search logic used by both GET and POST endpoints"""
-    if _INDEX is None:
-        raise HTTPException(400, "Index empty. Upload files first.")
+    
+    # *** 6. 关键更改：在请求时加载索引和分析器 ***
+    index = get_index_instance()
+    analyzer = get_analyzer_instance()
+
+    if not index.doc_ids: # 索引为空或加载失败
+        return []
 
     # Auto-detect mode if not specified
     search_mode = mode or _auto_mode(query)
-    s = Searcher(_INDEX, _ANALYZER)
+    s = Searcher(index, analyzer)
     results: list[ResultDoc] = []
     
-    # Track shown pages per document to avoid duplicates
     shown_pages: dict[str, set[int]] = {}
 
     if search_mode == "phrase":
-        pm = PhraseMatcher(_INDEX, _ANALYZER)
+        pm = PhraseMatcher(index, analyzer)
         hits = pm.match(query, keep_stopwords=True)
-        terms = _ANALYZER.tokenize(query, keep_stopwords=True)
+        terms = analyzer.tokenize(query, keep_stopwords=True)
         
         for doc_id in sorted(hits.keys()):
             if doc_id_filter and doc_id != doc_id_filter:
                 continue
-                
+            # ... (其余逻辑不变, 但确保帮助函数调用被更新)
             starts = hits[doc_id]
             hits_to_show = starts[:max_hits_per_doc]
             shown_pages[doc_id] = set()
             
             out_hits: list[HitData] = []
             for st in hits_to_show:
-                page = _page_of_pos(doc_id, st) or 1
+                page = _page_of_pos(index, doc_id, st) or 1 # *** 传递 index ***
                 
-                # Try table snippet first
                 table = _table_snippet(doc_id, page - 1, terms)
                 if table:
-                    # Only add snapshot if not already shown for this page
                     if page not in shown_pages.get(doc_id, set()):
                         table.snapshot_url = (
                             f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
@@ -447,9 +449,7 @@ def _perform_search(
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
                 else:
-                    # Fall back to text snippet
-                    snippet = _paragraph_snippet(doc_id, st, terms, context_lines)
-                    # Generate page snapshot if not already shown
+                    snippet = _paragraph_snippet(index, doc_id, st, terms, context_lines) # *** 传递 index ***
                     if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
                             f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
@@ -469,19 +469,19 @@ def _perform_search(
 
     elif search_mode == "boolean":
         docs = s.search_boolean(query)
-        terms = _ANALYZER.tokenize(query, keep_stopwords=False)
+        terms = analyzer.tokenize(query, keep_stopwords=False)
         
         for doc_id in docs:
             if doc_id_filter and doc_id != doc_id_filter:
                 continue
                 
-            all_positions = _all_term_positions(doc_id, terms)
+            all_positions = _all_term_positions(index, doc_id, terms) # *** 传递 index ***
             positions_to_show = all_positions[:max_hits_per_doc]
             shown_pages[doc_id] = set()
             
             out_hits: list[HitData] = []
             for pos in positions_to_show:
-                page = _page_of_pos(doc_id, pos) or 1
+                page = _page_of_pos(index, doc_id, pos) or 1 # *** 传递 index ***
                 
                 table = _table_snippet(doc_id, page - 1, terms)
                 if table:
@@ -496,7 +496,7 @@ def _perform_search(
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
                 else:
-                    snippet = _paragraph_snippet(doc_id, pos, terms, context_lines)
+                    snippet = _paragraph_snippet(index, doc_id, pos, terms, context_lines) # *** 传递 index ***
                     if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
                             f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
@@ -516,19 +516,19 @@ def _perform_search(
 
     else:  # ranked
         top = s.search_ranked(query, k=20)
-        terms = _ANALYZER.tokenize(query, keep_stopwords=False)
+        terms = analyzer.tokenize(query, keep_stopwords=False)
         
         for doc_id, score in top:
             if doc_id_filter and doc_id != doc_id_filter:
                 continue
                 
-            all_positions = _all_term_positions(doc_id, terms)
+            all_positions = _all_term_positions(index, doc_id, terms) # *** 传递 index ***
             positions_to_show = all_positions[:max_hits_per_doc]
             shown_pages[doc_id] = set()
             
             out_hits: list[HitData] = []
             for pos in positions_to_show:
-                page = _page_of_pos(doc_id, pos) or 1
+                page = _page_of_pos(index, doc_id, pos) or 1 # *** 传递 index ***
                 
                 table = _table_snippet(doc_id, page - 1, terms)
                 if table:
@@ -543,7 +543,7 @@ def _perform_search(
                         shown_pages.setdefault(doc_id, set()).add(page)
                     out_hits.append(table)
                 else:
-                    snippet = _paragraph_snippet(doc_id, pos, terms, context_lines)
+                    snippet = _paragraph_snippet(index, doc_id, pos, terms, context_lines) # *** 传递 index ***
                     if page not in shown_pages.get(doc_id, set()):
                         snippet.snapshot_url = (
                             f"/page-snapshot?doc_id={ul.quote_plus(doc_id)}"
@@ -565,21 +565,27 @@ def _perform_search(
     return results
 
 
-# Routes
+# --- 路由 (重构为无状态) ---
 
 @app.get("/", response_class=JSONResponse)
 def root_status() -> dict[str, Any]:
+    """
+    根状态现在也从磁盘动态加载索引。
+    """
+    idx = get_index_instance() # *** 7. 动态加载索引 ***
     return {
         "app": "EviSearch-Py",
-        "docs": len(_INDEX.doc_ids) if _INDEX else 0,
-        "vocab": _INDEX.vocabulary_size() if _INDEX else 0,
+        "docs": len(idx.doc_ids) if idx else 0,
+        "vocab": idx.vocabulary_size() if idx else 0,
         "auth": "on" if _needs_auth() else "off",
     }
 
 
 @app.get("/ui", response_class=HTMLResponse)
 def ui_page() -> HTMLResponse:
-    # Enhanced UI with larger drop zone and improved features
+    """(保持不变)"""
+    # (保留你的 /ui HTML)
+    # ...
     return HTMLResponse("""
 <!doctype html>
 <html>
@@ -1064,7 +1070,8 @@ function xhrUpload(file, row, fileId) {
                     statusSpan.textContent = `uploading ${p}%`;
                 } else {
                     // p is 100%
-                    statusSpan.textContent = `Processing (OCR may take a moment)...`;
+                    // *** 8. 更新 UI 文本以反映异步处理 ***
+                    statusSpan.textContent = `Processing...`;
                 }
             }
         };
@@ -1073,22 +1080,25 @@ function xhrUpload(file, row, fileId) {
             activeXHRs.delete(fileId);
             if (xhr.status >= 200 && xhr.status < 300) {
                 row.querySelector('progress').value = 100;
-                // after upload completes, show "indexed"
-                row.querySelector('span').textContent = 'indexed';
+                // *** 9. 更新 UI 文本 ***
+                // 状态现在是 "Accepted" (已接收), 正在后台排队
+                // 我们将显示 "Queued" (已排队)，
+                // 并在 refreshState() 轮询时变为 "indexed"。
+                // (更高级的实现会使用 WebSocket 或轮询任务状态)
+                row.querySelector('span').textContent = 'Queued for indexing';
                 resolve();
             } else { 
-                row.querySelector('span').textContent = 'error'; // add error status
+                row.querySelector('span').textContent = 'error';
                 reject(new Error('Upload failed')); 
             }
         };
         xhr.onerror = () => { 
             activeXHRs.delete(fileId); 
-            row.querySelector('span').textContent = 'error'; // same as above
+            row.querySelector('span').textContent = 'error';
             reject(new Error('Network error')); 
         };
         xhr.onabort = () => { 
             activeXHRs.delete(fileId); 
-            // Show cancelled status
             reject(new Error('Aborted')); 
         };
         xhr.send(fd);
@@ -1338,141 +1348,120 @@ refreshState();
 </html>
 """)
 
-# Indexing and Search Endpoints
-
-def _rebuild_index_from_docs() -> None:
-    global _INDEX
-    writer = IndexWriter(_ANALYZER, index_stopwords=True)
-    for did, (text, page_map) in _DOC_DATA.items():
-        writer.add(did, text, page_map=page_map)
-    _INDEX = writer.commit()
-
 
 @app.post("/index-files", response_model=IndexOut, dependencies=[Depends(_check_auth)])
 async def index_files(files: list[UploadFile] = File(...)) -> IndexOut: # noqa: B008
+    """
+    *** 9. 重构的 /index-files 端点 ***
+    """
     if not files:
         raise HTTPException(400, "no files")
 
-    added = 0
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    
+    count = 0
+    files_saved = False # <--- 1. 添加一个标志
+    
     for f in files:
-        dest = UPLOAD_DIR / f.filename
-        with dest.open("wb") as w:
-            w.write(await f.read())
-
+        if not f.filename:
+            continue
+            
         doc_id = _safe_doc_id(f.filename)
-        _DOC_PATHS[doc_id] = str(dest)
-        _FILENAME_TO_DOC_ID[f.filename] = doc_id
+        file_extension = os.path.splitext(f.filename)[1]
+        safe_filename = f"{doc_id}{file_extension}"
+        dest = UPLOAD_DIR / safe_filename
+        
+        try:
+            with dest.open("wb") as w:
+                w.write(await f.read())
+            
+            count += 1
+            files_saved = True # <--- 2. 设置标志
+            
+        except Exception as e:
+            print(f"ERROR: [API] Failed to save {f.filename}: {e}")
 
-        text = ""
-        page_map = []
+    # *** 10. 将任务分派移到循环之外 ***
+    if files_saved:
+        print(f"INFO: [API] {count} files saved. Triggering re-index.")
+        trigger_reindex.delay() # <--- 3. 只在这里调用一次
+    
+    return IndexOut(
+        ok=True, 
+        indexed=count,
+        vocab=get_index_instance().vocabulary_size()
+    )
 
-        file_ext = f.filename.lower().split('.')[-1]
-
-        if file_ext == "pdf":
-            try:
-                text, page_map = _extract_pdf_text_and_page_map(dest)
-            except Exception as e:
-                print(f"Error extracting PDF text for {f.filename}: {e}")
-                if dest.exists():
-                    dest.unlink()
-                _DOC_PATHS.pop(doc_id, None)
-                continue
-        else: # Assume plain text
-            text = dest.read_text(encoding="utf-8", errors="ignore")
-            page_map = []
-
-        _DOC_DATA[doc_id] = (text, page_map)
-        added += 1
-
-    with _INDEX_LOCK:
-        _rebuild_index_from_docs()
-
-    return IndexOut(ok=True, indexed=added, vocab=_INDEX.vocabulary_size() if _INDEX else 0)
 
 @app.get("/files", response_model=FileListOut, dependencies=[Depends(_check_auth)])
 def list_files() -> FileListOut:
-    # Get original filenames from the mapping
-    original_names = list(_FILENAME_TO_DOC_ID.keys())
-    
-    # Fallback: if doc_id doesn't have a mapping, use doc_id itself
-    for doc_id in _DOC_DATA.keys():
-        if doc_id not in _FILENAME_TO_DOC_ID.values():
-            original_names.append(doc_id)
-    
-    return FileListOut(files=sorted(set(original_names)))
+    """
+    *** 11. 重构的 /files 端点 ***
+    不再从内存变量读取，而是直接扫描 UPLOAD_DIR。
+    """
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    # 我们只返回 doc_id (不带扩展名的文件名)
+    files = sorted(set(_safe_doc_id(p.name) for p in UPLOAD_DIR.glob("*.*")))
+    return FileListOut(files=files)
+
 
 @app.delete("/files", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
 def delete_all_files() -> DeleteOut:
-    """Deletes all uploaded files and clears the index."""
-    global _INDEX, _FILENAME_TO_DOC_ID  #  _FILENAME_TO_DOC_ID
+    """
+    *** 12. 重构的 /delete-all 端点 ***
+    删除所有文件，然后触发一次重新索引。
+    """
+    deleted_count = 0
+    for p in UPLOAD_DIR.glob("*.*"):
+        try:
+            p.unlink()
+            deleted_count += 1
+        except Exception as e:
+            print(f"WARN: [API] Could not delete file {p.name}: {e}")
 
-    for _, path_str in _DOC_PATHS.items():
-        if path_str:
-            path_to_delete = Path(path_str)
-            
-            if path_to_delete.exists():
-                try:
-                    path_to_delete.unlink()
-                except Exception as e:
-                    print(f"WARN: Could not delete file {path_to_delete.name}: {e}")
+    # 触发一次空的重建（这将清空索引）
+    trigger_reindex.delay()
 
-    # Clear in-memory data stores
-    _DOC_DATA.clear()
-    _DOC_PATHS.clear()
-    _FILENAME_TO_DOC_ID.clear()  
+    return DeleteOut(ok=True, message=f"All {deleted_count} files removed. Re-indexing triggered.")
 
-    # Reset the index
-    with _INDEX_LOCK:
-        _INDEX = None
-
-    return DeleteOut(ok=True, message="All files removed and index cleared.")
 
 @app.delete("/files/{name}", response_model=DeleteOut, dependencies=[Depends(_check_auth)])
 def delete_file(name: str) -> DeleteOut: 
-    global _INDEX, _FILENAME_TO_DOC_ID
-
-    # Decode URL-encoded name
+    """
+    *** 13. 重构的 /delete-one 端点 ***
+    删除一个文件（及其所有扩展名变体），然后触发一次重新索引。
+    """
     decoded_name = ul.unquote_plus(name)
+    # name 可能是 doc_id 或完整文件名，我们使用 _safe_doc_id 来标准化
+    doc_id = _safe_doc_id(decoded_name)
     
-    # Try to find doc_id from original filename first
-    doc_id = _FILENAME_TO_DOC_ID.get(decoded_name)
     if not doc_id:
-        # Fallback to sanitized version
-        doc_id = _safe_doc_id(decoded_name)
+        raise HTTPException(404, f"Document '{decoded_name}' is invalid")
     
-    # Check if document exists
-    if doc_id not in _DOC_DATA:
-        raise HTTPException(404, f"Document '{decoded_name}' not found")
+    # 查找此 doc_id 的所有文件 (.pdf, .txt 等)
+    files_to_delete = list(UPLOAD_DIR.glob(f"{doc_id}.*"))
     
-    # Remove from all data structures
-    _DOC_DATA.pop(doc_id, None)
-    
-    # Remove from filename mapping
-    _FILENAME_TO_DOC_ID = {k: v for k, v in _FILENAME_TO_DOC_ID.items() if v != doc_id}
-    
-    # get the path to delete and remove from _DOC_PATHS
-    path_str_to_delete = _DOC_PATHS.pop(doc_id, None)
+    if not files_to_delete:
+        raise HTTPException(404, f"Document '{doc_id}' not found in uploads")
 
-    if path_str_to_delete:
-        path_to_delete = Path(path_str_to_delete)
-        
-        # delete the main file
-        if path_to_delete.exists():
-            try:
-                path_to_delete.unlink()
-            except Exception as e:
-                print(f"WARN: Could not delete file {path_to_delete.name}: {e}")
+    deleted_name = ""
+    for p in files_to_delete:
+        try:
+            deleted_name = p.name
+            p.unlink()
+        except Exception as e:
+            print(f"WARN: [API] Could not delete file {p.name}: {e}")
+            raise HTTPException(500, f"Failed to delete file {p.name}")
 
-    with _INDEX_LOCK:
-        if _DOC_DATA:
-            _rebuild_index_from_docs()
-        else:
-            _INDEX = None
+    # 触发重建
+    trigger_reindex.delay()
 
-    return DeleteOut(ok=True, message=f"removed {name}")
+    return DeleteOut(ok=True, message=f"Removed {deleted_name}. Re-indexing triggered.")
+
 
 @app.post("/search", response_model=SearchOut, dependencies=[Depends(_check_auth)])
 def search_endpoint(payload: SearchIn) -> SearchOut:
+    """(保持不变, 只是调用重构后的 _perform_search)"""
     results = _perform_search(
         payload.q,
         mode=payload.mode,
@@ -1482,6 +1471,7 @@ def search_endpoint(payload: SearchIn) -> SearchOut:
     )
     return SearchOut(results=results)
 
+
 @app.get(
     "/page-snapshot",
     response_class=StreamingResponse,
@@ -1490,6 +1480,7 @@ def search_endpoint(payload: SearchIn) -> SearchOut:
 def page_snapshot(
     doc_id: Annotated[str, Query(..., description="document id (= filename)")],
     page: Annotated[int, Query(..., ge=1, description="1-based page number")],
+    # ... (所有其他参数保持不变)
     x0: float = 0,  
     y0: float = 0,
     x1: float = 612,
@@ -1499,30 +1490,24 @@ def page_snapshot(
     boxes: str | None = None,        
     scale: float = 3.0,              
 ):
-    """High-DPI PNG snapshot; highlight terms and draw table boxes (yellow)."""
-    # Decode URL-encoded doc_id
+    """
+    *** 14. 重构的 /page-snapshot 端点 ***
+    (大部分保持不变，只是使用了 _get_doc_path)
+    """
     decoded_doc_id = ul.unquote_plus(doc_id)
     
-    # Try to find with decoded version first
-    pdf_path = _DOC_PATHS.get(decoded_doc_id)
+    # 使用新的帮助函数
+    pdf_path = _get_doc_path(decoded_doc_id)
     
-    # If not found, try with sanitized version (in case spaces were converted to underscores)
-    if not pdf_path:
-        sanitized_doc_id = _safe_doc_id(decoded_doc_id)
-        pdf_path = _DOC_PATHS.get(sanitized_doc_id)
-        doc_id = sanitized_doc_id  # Update doc_id for error message
-    else:
-        doc_id = decoded_doc_id
-    
-    if not pdf_path or not os.path.exists(pdf_path):
-        print(f"ERROR: Document not found. Requested doc_id: '{doc_id}'")
-        print(f"Available doc_ids: {list(_DOC_PATHS.keys())}")
-        raise HTTPException(404, f"file not found: {doc_id}")
+    if not pdf_path or pdf_path.suffix.lower() != ".pdf":
+        print(f"ERROR: [API] PDF path not found for doc_id: '{decoded_doc_id}'")
+        raise HTTPException(404, f"PDF file not found for: {decoded_doc_id}")
 
     if not (1.0 <= scale <= 4.0):
         scale = 3.0
 
-    # Parse boxes
+    # (其余逻辑与你的原始 api.py 完全相同)
+    # ...
     box_list: list[tuple[float, float, float, float]] = []
     if boxes:
         try:
@@ -1535,36 +1520,28 @@ def page_snapshot(
         except Exception:
             box_list = []
 
-    # Parse terms
     term_list: list[str] = []
     if terms:
-        # Decode URL-encoded terms (e.g., "power%20usage" -> "power usage")
         decoded_terms = ul.unquote_plus(terms)
-        # Split by comma or whitespace
         term_list = [t for t in re.split(r"[,\s]+", decoded_terms) if t]
 
     doc = None
     try:
-        # Open PDF
-        doc = fitz.open(pdf_path)  # type: ignore[no-untyped-call]
+        doc = fitz.open(pdf_path)
         if page < 1 or page > doc.page_count:
-            raise HTTPException(404, f"Page {page} not found in {doc_id}")
+            raise HTTPException(404, f"Page {page} not found in {decoded_doc_id}")
             
-        p = doc.load_page(page - 1)  # 0-based
+        p = doc.load_page(page - 1)
 
-        # highlight terms (case-insensitive without unavailable flags)
         if term_list:
             def _search_rects_ci(page: fitz.Page, term: str):
-                # Try common case variants and deduplicate rectangles
                 variants = {term, term.lower(), term.upper(), term.title()}
                 rects = []
                 for v in variants:
                     try:
-                        # PyMuPDF 1.26.4: search_for is case-sensitive; no TEXT_IGNORECASE flag.
-                        rects.extend(page.search_for(v))  # type: ignore[attr-defined]
+                        rects.extend(page.search_for(v))
                     except Exception:
                         pass
-                # de-dup by rounded coords to avoid multi-variant duplicates
                 seen, out = set(), []
                 for r in rects:
                     key = (round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2))
@@ -1576,22 +1553,20 @@ def page_snapshot(
             for t in term_list:
                 for r in _search_rects_ci(p, t):
                     try:
-                        p.add_highlight_annot(r)  # default highlight (yellow-ish)
+                        p.add_highlight_annot(r)
                     except Exception:
                         pass
 
-        #  draw boxes
         for (bx0, by0, bx1, by1) in box_list:
             rect = fitz.Rect(bx0, by0, bx1, by1)
             ann = p.add_rect_annot(rect)
             try:
-                ann.set_colors(stroke=(1, 1, 0))  # yellow
+                ann.set_colors(stroke=(1, 1, 0))
                 ann.set_border(width=2)
                 ann.update()
             except Exception:
                 pass
 
-        # get pixmap
         if full:
             clip_rect = p.mediabox
         else:
@@ -1602,10 +1577,8 @@ def page_snapshot(
         buf = io.BytesIO(pix.tobytes("png")) 
         img = Image.open(buf).convert("RGB")  
 
-        # 
         draw = ImageDraw.Draw(img)
         w, h = img.size
-        # Draw a subtle border around the image
         draw.rectangle([(0, 0), (w - 1, h - 1)], outline=(43, 58, 85))
 
         bio = io.BytesIO()
@@ -1614,17 +1587,16 @@ def page_snapshot(
         return StreamingResponse(bio, media_type="image/png")
     
     except HTTPException:
-        # Re-raise explicit HTTP errors (404, etc.)
         raise
         
     except Exception as e:
         import traceback
-        print(f"FATAL: Error generating snapshot for {doc_id} page {page}: {e}")
+        print(f"FATAL: [API] Error generating snapshot for {decoded_doc_id} page {page}: {e}")
         print(traceback.format_exc())
         
-        raise HTTPException(  # noqa: B904
+        raise HTTPException(
             status_code=500, 
-            detail=f"Failed to generate page snapshot due to internal error. Check server logs for details. Error: {type(e).__name__}"
+            detail=f"Failed to generate page snapshot. Error: {type(e).__name__}"
         )
         
     finally:
