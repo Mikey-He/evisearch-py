@@ -22,7 +22,8 @@ dependencies = [
     "celery>=5.0.0",
     "redis>=4.0.0",
     "ocrmypdf>=15.0.0",
-    "gunicorn>=20.0.0"
+    "gunicorn>=20.0.0",
+    "gevent>=23.0.0"
 ]
 
 #  Optional dependencies for development and testing
